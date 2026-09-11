@@ -1,0 +1,30 @@
+# OTel Collector:接收原生 OTLP 指标(Claude Code / Gemini CLI / Codex),
+# 以 Prometheus 文本格式暴露在 :8889 供 Prometheus 抓取。
+#
+# Claude Code 接入示例(开发者机器上):
+#   export CLAUDE_CODE_ENABLE_TELEMETRY=1
+#   export OTEL_METRICS_EXPORTER=otlp
+#   export OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/json
+#   export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://<collector>:4318/v1/metrics
+#
+# 说明:metrics-monitor server 本身也能直接接收 OTLP/JSON(POST /v1/metrics),
+# 本 collector 是给希望继续用 Prometheus/Grafana 全家桶的团队的可选路径。
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    metric_expiration: 1h
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]

@@ -1,0 +1,40 @@
+{
+	"name": "pizza-metrics-monitor",
+	"version": "0.1.0",
+	"description": "AI coding agent efficiency platform (能效管理平台): client-side metrics plugin + cloud-side server. Tracks active users, token/cost consumption and AI edit adoption rate across pizza, Claude Code, OpenCode, Codex and any OTLP-speaking tool. Push & pull (Prometheus) both supported.",
+	"type": "module",
+	"engines": {
+		"node": ">=22.5.0"
+	},
+	"bin": {
+		"pizza-metrics": "./dist/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./pizza-extension": {
+			"types": "./dist/adapters/pizza-live.d.ts",
+			"import": "./dist/adapters/pizza-live.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+		"test": "vitest --run",
+		"test:watch": "vitest",
+		"prepublishOnly": "npm run build"
+	},
+	"devDependencies": {
+		"@mariozechner/jiti": "^2.6.5",
+		"@types/node": "^22.10.0",
+		"typescript": "^5.7.0",
+		"vitest": "^3.2.4"
+	}
+}

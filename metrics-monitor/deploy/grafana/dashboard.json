@@ -1,0 +1,119 @@
+{
+  "title": "AI 能效管理平台 (metrics-monitor)",
+  "uid": "metrics-monitor",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "1m",
+  "time": { "from": "now-7d", "to": "now" },
+  "tags": ["metrics-monitor", "ai-coding"],
+  "templating": {
+    "list": [
+      {
+        "name": "tool",
+        "label": "工具",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(agent_tokens_total, tool)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "日活跃用户 (DAU)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "agent_active_users{window=\"daily\"}", "legendFormat": "DAU" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "blue" }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "周活跃用户 (WAU)",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "agent_active_users{window=\"weekly\"}", "legendFormat": "WAU" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "purple" }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "月活跃用户 (MAU)",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "agent_active_users{window=\"monthly\"}", "legendFormat": "MAU" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "编辑采纳率 (90d)",
+      "description": "accept / (accept + reject),口径对齐 GitHub Copilot",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "agent_edit_adoption_rate", "legendFormat": "adoption" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "red" }, { "color": "orange", "value": 0.3 }, { "color": "green", "value": 0.6 }]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Token 消耗速率 (按类型, 每日增量)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(increase(agent_tokens_total{tool=~\"$tool\",type=\"input\"}[1d]))", "legendFormat": "input" },
+        { "expr": "sum(increase(agent_tokens_total{tool=~\"$tool\",type=\"output\"}[1d]))", "legendFormat": "output" },
+        { "expr": "sum(increase(agent_tokens_total{tool=~\"$tool\",type=\"cache_read\"}[1d]))", "legendFormat": "cache_read" },
+        { "expr": "sum(increase(agent_tokens_total{tool=~\"$tool\",type=\"cache_write\"}[1d]))", "legendFormat": "cache_write" },
+        { "expr": "sum(increase(agent_tokens_total{tool=~\"$tool\",type=\"reasoning\"}[1d]))", "legendFormat": "reasoning" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 20 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "预估成本 (USD, 每日增量)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(increase(agent_cost_usd_total{tool=~\"$tool\"}[1d])) by (tool)", "legendFormat": "{{tool}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "custom": { "fillOpacity": 20 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "编辑采纳率趋势 (按工具, 7d 窗口)",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_edit_decisions_total{tool=~\"$tool\",decision=\"accept\"}[7d])) by (tool) / clamp_min(sum(increase(agent_edit_decisions_total{tool=~\"$tool\"}[7d])) by (tool), 1)",
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    },
+    {
+      "type": "timeseries",
+      "title": "会话与请求数 (每日增量)",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum(increase(agent_sessions_total{tool=~\"$tool\"}[1d])) by (tool)", "legendFormat": "sessions {{tool}}" },
+        { "expr": "sum(increase(agent_requests_total{tool=~\"$tool\"}[1d])) by (tool)", "legendFormat": "requests {{tool}}" }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "按用户消耗排行",
+      "gridPos": { "x": 0, "y": 20, "w": 24, "h": 8 },
+      "targets": [
+        { "expr": "sum(increase(agent_tokens_total{tool=~\"$tool\"}[7d])) by (user, tool)", "legendFormat": "{{user}} {{tool}}", "format": "table", "instant": true }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true } } }
+      ]
+    }
+  ]
+}

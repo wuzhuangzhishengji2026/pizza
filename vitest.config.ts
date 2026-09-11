@@ -6,6 +6,8 @@ export default defineConfig({
     setupFiles: ['./test/setup-isolation.ts'],
     environment: 'node',
     testTimeout: 60000, // 60 seconds — CI runners are slower than local
+    // metrics-monitor has its own vitest suite (cd metrics-monitor && npm test)
+    exclude: ['**/node_modules/**', '**/dist/**', 'metrics-monitor/**'],
     server: {
       deps: {
         external: [/@silvia-odwyer\/photon-node/],

@@ -1,0 +1,64 @@
+> 可选的完整监控栈：metrics-monitor server(自带 dashboard)+ Prometheus + Grafana + OTel Collector。
+> 不需要 Grafana/Prometheus 时，`pizza-metrics serve` 单进程即可运行整个平台。
+>
+# metrics-monitor 可选部署栈
+#
+#   docker compose up -d
+#
+#   - metrics server  http://localhost:9480/        (内置 dashboard + 推送/拉取 API)
+#   - prometheus      http://localhost:9090/        (抓取 server /metrics 与 agent /metrics)
+#   - grafana         http://localhost:3000/        (预置 dashboard, admin/admin)
+#   - otel collector  http://localhost:4318/        (接收任意 OTLP/HTTP 指标,如 Claude Code 直推)
+#
+# 首次运行后可执行: node dist/cli.js seed --server http://127.0.0.1:9480 灌入演示数据
+
+services:
+  metrics-server:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install --omit=dev --no-audit --no-fund && npm run build && node dist/cli.js serve --host 0.0.0.0 --db /data/server.sqlite"
+    volumes:
+      - ..:/app
+      - metrics-data:/data
+    ports:
+      - "9480:9480"
+    environment:
+      PIZZA_METRICS_SERVER_PORT: "9480"
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  otel-collector:
+    # Claude Code / Gemini CLI 等原生 OTLP 推送的统一入口,
+    # 转成 Prometheus 指标后由 Prometheus 抓取(与 metrics-monitor 互补)
+    image: otel/opentelemetry-collector-contrib:0.160.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8889:8889"
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboard.json:/var/lib/grafana/dashboards/metrics-monitor.json:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+
+volumes:
+  metrics-data:
+  prometheus-data:
+  grafana-data:

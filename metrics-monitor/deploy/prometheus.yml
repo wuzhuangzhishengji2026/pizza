@@ -1,0 +1,24 @@
+# Prometheus 抓取配置
+#
+# 1) metrics-monitor server 自身的 /metrics(全量累计值 + KPI gauge)
+# 2) 各开发者机器上的 agent 本地 /metrics(内网可达时逐台登记)
+# 3) otel-collector 转出的 claude_code.* / gemini_cli.* / codex.* 指标
+#
+global:
+  scrape_interval: 30s
+
+scrape_configs:
+  - job_name: metrics-monitor-server
+    static_configs:
+      - targets: ["metrics-server:9480"]
+
+  # 多台开发机时在此登记各 agent 的 9465 端口(或用服务发现)
+  - job_name: metrics-monitor-agents
+    static_configs:
+      - targets:
+          # - "192.168.1.101:9465"
+          # - "192.168.1.102:9465"
+
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
