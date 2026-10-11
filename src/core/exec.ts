@@ -5,6 +5,7 @@
 import { spawn } from "node:child_process";
 import { waitForChildProcess } from "../utils/child-process.js";
 import { getShellEnv } from "../utils/shell.js";
+import { prefetchLoginShellPath } from "../utils/login-shell-path.js";
 
 /**
  * Options for executing shell commands.
@@ -16,6 +17,8 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/** Extra environment variables to merge into the login-shell environment. */
+	env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -38,6 +41,9 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
+	// Capture the login-shell PATH without blocking the event loop; the
+	// sync getShellEnv() below then hits the cache.
+	await prefetchLoginShellPath();
 	return new Promise((resolve) => {
 		const proc = spawn(command, args, {
 			cwd,
@@ -48,7 +54,7 @@ export async function execCommand(
 			// context with a minimal PATH (e.g. macOS launchd/Tauri). Without this,
 			// `npm install -g agent-browser` fails with exit 1 because `npm` is not
 			// on the inherited PATH.
-			env: getShellEnv(),
+			env: { ...getShellEnv(), ...options?.env },
 		});
 
 		let stdout = "";

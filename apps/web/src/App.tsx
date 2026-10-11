@@ -5,13 +5,13 @@ import { PxlKitSurfaceProvider } from "@pxlkit/ui-kit";
 import Layout from "@/components/Layout";
 import AgentView from "@/views/AgentView";
 import SettingsView from "@/views/SettingsView";
-import PluginsView from "@/views/PluginsView";
 import { subscribeSidecarExit, subscribeEvents, initSidecar, sendCommandAwait, listWorkspaces, deleteWorkspace, restartSidecar, stopMainAgent, setRpcWorkspace } from "@/lib/transport";
+import { refreshCustomThemes } from "@/lib/theme";
 import { BrandIcon } from "@/components/BrandIcon";
 import { ConfirmHost } from "@/components/ui";
 import { alertDialog } from "@/lib/confirm";
 import type { RpcSessionState, WorkspaceMeta } from "@/lib/types";
-import { isTauri } from "@/lib/utils";
+import { isTauri, isMainChatCwd, samePath } from "@/lib/utils";
 
 function isMainAgentConflictError(message: string): boolean {
 	return message.includes("Another main agent instance is already running");
@@ -62,7 +62,7 @@ function AppInner() {
 		try {
 			const list = await listWorkspaces();
 			// Filter out the Chat workspace (~/.pizza/main) — it's shown separately as Chat.
-			setWorkspaces(list.filter((ws) => !ws.cwd.endsWith("/.pizza/main")));
+			setWorkspaces(list.filter((ws) => !isMainChatCwd(ws.cwd)));
 		} catch (e) {
 			console.error("[workspaces] list error:", e);
 		}
@@ -123,6 +123,7 @@ function AppInner() {
 				setState(initialState as unknown as RpcSessionState);
 			}
 			setSidecarReady(true);
+			void refreshCustomThemes().catch(() => {});
 			// For already-running sidecar, request state explicitly.
 			if (!hasState) {
 				void sendCommandAwait<RpcSessionState>({ type: "get_state" })
@@ -186,7 +187,7 @@ function AppInner() {
 				restartTimerRef.current = setTimeout(() => {
 					restartTimerRef.current = null;
 					setWorkspace((current) => {
-						if (current === cwd) void startWithWorkspace(cwd);
+						if (samePath(current, cwd)) void startWithWorkspace(cwd);
 						return current;
 					});
 				}, delay);
@@ -225,7 +226,7 @@ function AppInner() {
 	}, [startWithWorkspace, t]);
 
 	const handleSelectWorkspace = useCallback(async (cwd: string) => {
-		if (workspace === cwd && sidecarReady) return;
+		if (samePath(workspace, cwd) && sidecarReady) return;
 		// Navigate back to agent page when selecting a workspace.
 		navigate("/");
 		// startWithWorkspace sets workspace AFTER initSidecar completes,
@@ -268,7 +269,7 @@ function AppInner() {
 		(async () => {
 			const un1 = await subscribeSidecarExit((code, cwd) => {
 				// Only act if the exited sidecar was the active one.
-				if (!cwd || cwd === workspace) {
+				if (!cwd || samePath(cwd, workspace)) {
 					if (code === null) {
 						// Gateway channel drop (bridge emits code:null) — the
 						// agent process is still alive in the gateway pool.
@@ -280,7 +281,7 @@ function AppInner() {
 						restartTimerRef.current = setTimeout(() => {
 							restartTimerRef.current = null;
 							setWorkspace((current) => {
-								if (current === (cwd ?? workspace)) void reconnectWorkspace(current!);
+								if (samePath(current, cwd ?? workspace)) void reconnectWorkspace(current!);
 								return current;
 							});
 						}, delay);
@@ -302,7 +303,7 @@ function AppInner() {
 							restartTimerRef.current = null;
 							// Guard against the user having switched workspaces in the meantime.
 							setWorkspace((current) => {
-								if (current === cwdToRestart) {
+								if (samePath(current, cwdToRestart)) {
 									void startWithWorkspace(cwdToRestart);
 								}
 								return current;
@@ -332,7 +333,7 @@ function AppInner() {
 					});
 				}
 				// Only process state updates for the active workspace.
-				if (typed._cwd && typed._cwd !== workspace) return;
+				if (typed._cwd && !samePath(typed._cwd, workspace)) return;
 				// Refresh state on model/thinking changes, and when the agent
 				// turn starts (isStreaming → true) or completes (isStreaming → false).
 				// Skip intermediate AGENT_TURN_END/REQUESTED during multi-tool turns
@@ -403,7 +404,7 @@ function AppInner() {
 		// Read the path off `window` rather than `useLocation` on purpose: we
 		// deliberately do NOT want this effect re-running on every navigation,
 		// otherwise an unconfigured user gets yanked back here the moment they
-		// try to visit /plugins or anywhere else.
+		// try to visit the plugins page or anywhere else.
 		if (!window.location.pathname.startsWith("/settings")) {
 			navigate("/settings?setup=true", { replace: true });
 		}
@@ -424,7 +425,7 @@ function AppInner() {
 
 	// Stale-workspace dialog: directory missing → offer removal, keep UI.
 	if (staleCwd) {
-		const staleWs = workspaces.find((ws) => ws.cwd === staleCwd);
+		const staleWs = workspaces.find((ws) => samePath(ws.cwd, staleCwd));
 		const removeStale = async () => {
 			if (staleWs) {
 				try {
@@ -438,12 +439,12 @@ function AppInner() {
 			refreshWorkspaces();
 		};
 		const p = (
-			<PxlKitSurfaceProvider surface="pixel">
+			<PxlKitSurfaceProvider surface="linear">
 				<ConfirmHost />
 				<div className="flex h-screen items-center justify-center bg-bg">
 					<div className="flex max-w-lg flex-col items-center gap-4 px-6 text-center">
 						<BrandIcon size={48} className="text-warning" />
-						<p className="font-mono text-sm text-fg">{t("agent.staleWorkspaceTitle")}</p>
+						<p className="text-sm text-fg">{t("agent.staleWorkspaceTitle")}</p>
 						<p className="max-w-md break-all text-sm leading-6 text-muted">{staleCwd}</p>
 						<p className="text-xs text-muted">{t("agent.staleWorkspaceBody")}</p>
 						<div className="mt-2 flex flex-wrap justify-center gap-3">
@@ -472,18 +473,18 @@ function AppInner() {
 	if (initError) {
 		const mainAgentConflict = isMainAgentConflictError(initError);
 		return (
-			<PxlKitSurfaceProvider surface="pixel">
+			<PxlKitSurfaceProvider surface="linear">
 				<div className="flex h-screen items-center justify-center bg-bg">
 					<div className="flex max-w-lg flex-col items-center gap-4 px-6 text-center">
 						<BrandIcon size={48} className="text-danger" />
-						<p className="font-mono text-sm text-fg">
+						<p className="text-sm text-fg">
 							{mainAgentConflict ? t("agent.mainConflictTitle") : t("agent.failedToStartWorkspace")}
 						</p>
 						{mainAgentConflict ? (
 							<>
 								<p className="max-w-md text-sm leading-6 text-muted">{t("agent.mainConflictBody")}</p>
 								<details className="w-full text-left">
-									<summary className="cursor-pointer font-mono text-xs text-muted">{t("agent.errorDetails")}</summary>
+									<summary className="cursor-pointer text-xs text-muted">{t("agent.errorDetails")}</summary>
 									<pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-surface-2 p-3 text-xs text-muted">
 										{initError}
 									</pre>
@@ -512,7 +513,7 @@ function AppInner() {
 							</>
 						) : (
 							<>
-								<p className="font-mono text-xs text-muted">{initError}</p>
+								<p className="text-xs text-muted">{initError}</p>
 								<button
 									type="button"
 									onClick={() => {
@@ -538,11 +539,11 @@ function AppInner() {
 	// is no live sidecar to show (first start / crashed sidecar).
 	if (waitingForWorkspace && !sidecarReady) {
 		return (
-			<PxlKitSurfaceProvider surface="pixel">
+			<PxlKitSurfaceProvider surface="linear">
 				<div className="flex h-screen items-center justify-center bg-bg">
 					<div className="flex flex-col items-center gap-4">
 						<BrandIcon size={48} className="text-accent" />
-						<p className="font-mono text-sm text-muted">{t("common.starting")}</p>
+						<p className="text-sm text-muted">{t("common.starting")}</p>
 					</div>
 				</div>
 			</PxlKitSurfaceProvider>
@@ -550,7 +551,7 @@ function AppInner() {
 	}
 
 	return (
-		<PxlKitSurfaceProvider surface="pixel">
+		<PxlKitSurfaceProvider surface="linear">
 			<ConfirmHost />
 			<Routes>
 					<Route
@@ -610,7 +611,6 @@ function AppInner() {
 								}}
 							/>
 						} />
-					<Route path="/plugins" element={<PluginsView />} />
 					<Route path="*" element={<Navigate to="/" replace />} />
 					</Route>
 			</Routes>

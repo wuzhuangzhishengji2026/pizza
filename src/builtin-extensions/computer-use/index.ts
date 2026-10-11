@@ -18,8 +18,8 @@
  *   browser_page roots are removed in-tree). Web -> agent-browser, desktop
  *   apps -> computer-use.
  * - `/computer` manages the lifecycle: install (native helper app),
- *   status, uninstall, disable, enable. Disable persists via
- *   `settings.disabledBuiltinExtensions`.
+ *   status, uninstall, disable, enable. Disable and install state persist
+ *   via `extensions.json` (ExtensionRegistry).
  */
 
 import { existsSync } from "node:fs";
@@ -55,6 +55,12 @@ import {
   helperInstalled,
   macosHelperAppPath,
 } from "./cli-command.js";
+import {
+  getMacosPermissionStatus,
+  recheckMacosPermissions,
+  registerMacosPermissionPrompts,
+} from "./backend/platform/macos/permissions.js";
+import type { PermissionKind, PermissionStatus } from "./backend/permissions.js";
 
 /** Upstream package version the vendored backend was taken from. */
 export const UPSTREAM_VERSION = "0.5.1";
@@ -66,7 +72,143 @@ export const HELPER_FOLDER_NAME = "pizza-computer-use.app";
 export const COMPUTER_USE_EXTENSION_ID = "computer-use";
 const UPSTREAM_PACKAGE = "@injaneity/pi-computer-use";
 
-/** Stable id used in `settings.disabledBuiltinExtensions`. */
+function formatPermissionState(status: PermissionStatus) {
+  const permissions = [
+    {
+      kind: "accessibility" as const,
+      label: "Accessibility",
+      description: "Allows Pizza Computer Use to read controls and click, type, or press keys in approved app windows.",
+      granted: status.accessibility,
+      required: true,
+    },
+    {
+      kind: "screenRecording" as const,
+      label: "Screen Recording",
+      description: "Allows Pizza Computer Use to read screenshots of approved windows when vision is enabled.",
+      granted: status.screenRecording,
+      required: true,
+    },
+  ];
+  return {
+    supported: true,
+    installed: true,
+    ready: permissions.every((permission) => permission.granted),
+    helperPath: macosHelperAppPath(),
+    permissions,
+  };
+}
+
+function unavailablePermissionState(message: string, installed = helperInstalled()) {
+  return {
+    supported: process.platform === "darwin",
+    installed,
+    ready: false,
+    helperPath: process.platform === "darwin" ? macosHelperAppPath() : undefined,
+    message,
+    permissions: [
+      {
+        kind: "accessibility" as const,
+        label: "Accessibility",
+        description: "Allows Pizza Computer Use to read controls and click, type, or press keys in approved app windows.",
+        granted: false,
+        required: true,
+      },
+      {
+        kind: "screenRecording" as const,
+        label: "Screen Recording",
+        description: "Allows Pizza Computer Use to read screenshots of approved windows when vision is enabled.",
+        granted: false,
+        required: true,
+      },
+    ],
+  };
+}
+
+function macosPermissionPaneUrl(kind: PermissionKind): string {
+  switch (kind) {
+    case "accessibility":
+      return "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+    case "screenRecording":
+      return "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+  }
+}
+
+/**
+ * Installed state from extensions.json (seeding pre-registry installs once via
+ * the legacy probe inside getBuiltinInstallState). Dynamic import:
+ * builtin-extensions/index.js imports this module, so a static import back
+ * would be a cycle.
+ */
+async function isRecordedInstalled(cwd: string): Promise<boolean> {
+  const { getBuiltinInstallState } = await import("../index.js");
+  const registry = SettingsManager.create(cwd, getAgentDir()).extensions;
+  return (await getBuiltinInstallState(registry, COMPUTER_USE_EXTENSION_ID, cwd)).installed;
+}
+
+/** Persist this extension's install state to extensions.json. */
+async function recordInstallState(
+  cwd: string,
+  state: { installed: boolean; version?: string },
+): Promise<void> {
+  const { recordBuiltinInstallState } = await import("../index.js");
+  const registry = SettingsManager.create(cwd, getAgentDir()).extensions;
+  recordBuiltinInstallState(registry, COMPUTER_USE_EXTENSION_ID, state);
+}
+
+export async function getComputerUsePermissionStatus(cwd: string) {
+  if (process.platform !== "darwin") {
+    return unavailablePermissionState(`computer-use permissions are currently managed only on macOS (detected ${process.platform}).`, false);
+  }
+  if (!(await isRecordedInstalled(cwd))) {
+    return unavailablePermissionState("Install computer-use before granting macOS permissions.", false);
+  }
+  try {
+    return formatPermissionState(await getMacosPermissionStatus());
+  } catch (error) {
+    return unavailablePermissionState(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+export async function recheckComputerUsePermissionStatus(cwd: string) {
+  if (process.platform !== "darwin") {
+    return unavailablePermissionState(`computer-use permissions are currently managed only on macOS (detected ${process.platform}).`, false);
+  }
+  if (!(await isRecordedInstalled(cwd))) {
+    return unavailablePermissionState("Install computer-use before granting macOS permissions.", false);
+  }
+  try {
+    return formatPermissionState(await recheckMacosPermissions());
+  } catch (error) {
+    return unavailablePermissionState(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+export async function openComputerUsePermissionSettings(cwd: string, kind: PermissionKind) {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      message: `computer-use permissions are currently managed only on macOS (detected ${process.platform}).`,
+    };
+  }
+  if (!(await isRecordedInstalled(cwd))) {
+    return { ok: false, message: "Install computer-use before opening permission settings." };
+  }
+  try {
+    const opened = await execCommand("/usr/bin/open", [macosPermissionPaneUrl(kind)], os.homedir(), { timeout: 5_000 });
+    if (opened.code !== 0) {
+      return {
+        ok: false,
+        message: opened.stderr || opened.stdout || "Failed to open macOS permission settings.",
+      };
+    }
+    return { ok: true, message: "Opened macOS permission settings." };
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 function notify(
   ctx: ExtensionCommandContext,
@@ -103,7 +245,7 @@ export async function checkComputerUseInstalled(
  * its setup script from there, so no binaries live in Pizza's repo.
  */
 export async function runComputerUseInstall(
-  _cwd: string,
+  cwd: string,
 ): Promise<InstallResult> {
   if (process.platform !== "darwin") {
     return {
@@ -148,7 +290,13 @@ export async function runComputerUseInstall(
     process.execPath,
     [setupScript, "--runtime"],
     pkgDir,
-    { timeout: 300_000 },
+    {
+      timeout: 300_000,
+      env: {
+        ELECTRON_RUN_AS_NODE: "1",
+        BUN_BE_BUN: "1",
+      },
+    },
   );
   if (setup.code !== 0) {
     return {
@@ -164,9 +312,27 @@ export async function runComputerUseInstall(
       message: `Helper installed, but rebranding failed: ${rebrand.message}`,
     };
   }
+  let permissionMessage =
+    "Open the permission buttons in Plugins → Extensions if Accessibility or Screen Recording is still missing.";
+  try {
+    await registerMacosPermissionPrompts();
+    const permissions = await getComputerUsePermissionStatus(cwd);
+    if (permissions.ready) {
+      permissionMessage = "All macOS permissions are ready.";
+    } else {
+      const missing = permissions.permissions
+        .filter((permission) => permission.required && !permission.granted)
+        .map((permission) => permission.label)
+        .join(" and ");
+      permissionMessage = `${missing} still needs to be enabled in macOS System Settings.`;
+    }
+  } catch (error) {
+    permissionMessage = `Helper installed, but permission setup needs attention: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  await recordInstallState(cwd, { installed: true, version: UPSTREAM_VERSION });
   return {
     ok: true,
-    message: `Helper installed at ${macosHelperAppPath()}. Grant Accessibility + Screen Recording when prompted (System Settings → Privacy & Security), then run /computer status.`,
+    message: `Helper installed at ${macosHelperAppPath()}. ${permissionMessage}`,
   };
 }
 
@@ -208,7 +374,7 @@ async function rebrandHelperApp(): Promise<InstallResult> {
 }
 
 export async function runComputerUseUninstall(
-  _cwd: string,
+  cwd: string,
 ): Promise<InstallResult> {
   if (process.platform !== "darwin") {
     return {
@@ -235,16 +401,20 @@ export async function runComputerUseUninstall(
       };
     }
   }
-  if (!removedAny) return { ok: true, message: "Helper app not installed." };
+  if (!removedAny) {
+    await recordInstallState(cwd, { installed: false });
+    return { ok: true, message: "Helper app not installed." };
+  }
   const pkgDir = path.join(getAgentDir(), "computer-use", "pkg");
   await rm(pkgDir, { recursive: true, force: true }).catch(() => undefined);
+  await recordInstallState(cwd, { installed: false });
   return {
     ok: true,
     message: `Helper app removed (${helperApp}). Remember to revoke its Accessibility/Screen Recording entries if you want.`,
   };
 }
 
-/** Persist enable/disable for this built-in extension in settings.json. */
+/** Persist enable/disable for this built-in extension in extensions.json. */
 function persistDisabled(cwd: string, disabled: boolean): void {
   const agentDir = getAgentDir();
   const settings = SettingsManager.create(cwd, agentDir);
@@ -322,11 +492,12 @@ export const createComputerUseExtension: ExtensionFactory = (
           return;
         }
         case "status": {
+          const installed = await isRecordedInstalled(cwd);
           const lines = [
             `Built-in extension: ${COMPUTER_USE_EXTENSION_ID} (enabled)`,
-            `Helper installed: ${helperInstalled() ? "yes" : "no"}${helperInstalled() ? ` (${macosHelperAppPath()})` : ""}`,
+            `Helper installed: ${installed ? "yes" : "no"}${installed ? ` (${macosHelperAppPath()})` : ""}`,
           ];
-          if (!helperInstalled()) {
+          if (!installed) {
             lines.push("Run /computer install to install it.");
           }
           try {

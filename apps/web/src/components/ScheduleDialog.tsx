@@ -38,8 +38,6 @@ function blankSpec(): ScheduleSpec {
 	};
 }
 
-const WEEKDAY_LABELS_ZH = ["日", "一", "二", "三", "四", "五", "六"];
-
 function defaultSessionTarget(sessionId?: string): SessionTarget {
 	return sessionId ? { kind: "pinned", sessionId } : { kind: "pinned" };
 }
@@ -81,6 +79,10 @@ export function ScheduleForm(props: ScheduleFormProps) {
 	const [enabled, setEnabled] = useState(existing?.enabled ?? true);
 	const [error, setError] = useState<string | null>(null);
 	const [saving, setSaving] = useState(false);
+	const weekdayShortRaw = t("schedule.weekdayShort", { returnObjects: true });
+	const weekdayLongRaw = t("schedule.weekdayLong", { returnObjects: true });
+	const weekdayShort: string[] = Array.isArray(weekdayShortRaw) ? weekdayShortRaw : [];
+	const weekdayLong: string[] = Array.isArray(weekdayLongRaw) ? weekdayLongRaw : [];
 	// Local draft input for the monthly day-of-month picker. Kept here so it
 	// survives re-renders of `renderModeFields` (which is a plain function,
 	// not a component, so it can't call hooks itself).
@@ -291,7 +293,7 @@ export function ScheduleForm(props: ScheduleFormProps) {
 					<div className="space-y-3">
 						<Field label={t("schedule.weekdays")}>
 							<div className="flex flex-wrap gap-1.5">
-								{WEEKDAY_LABELS_ZH.map((label, idx) => {
+								{weekdayShort.map((label, idx) => {
 									const d = idx as Weekday;
 									const on = selected.includes(d);
 									return (
@@ -305,7 +307,7 @@ export function ScheduleForm(props: ScheduleFormProps) {
 													? "border-accent bg-accent text-accent-fg"
 													: "border-border bg-surface-2 text-muted hover:bg-surface hover:text-fg",
 											)}
-											title={`周${label}`}
+											title={weekdayLong[idx]}
 										>
 											{label}
 										</button>
@@ -444,7 +446,7 @@ export function ScheduleForm(props: ScheduleFormProps) {
 				</Field>
 
 				<div className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-[180px_1fr] sm:items-center">
-					<span className="text-xs font-medium uppercase tracking-wider text-muted">{t("schedule.mode")}</span>
+					<span className="text-xs font-medium text-muted">{t("schedule.mode")}</span>
 					<ScheduleModePicker
 						value={spec.mode}
 						onChange={(mode) => {
@@ -477,7 +479,7 @@ export function ScheduleForm(props: ScheduleFormProps) {
 							setSpec(next);
 						}}
 					/>
-					<span className="self-start text-xs font-medium uppercase tracking-wider text-muted">{t("schedule.details")}</span>
+					<span className="self-start text-xs font-medium text-muted">{t("schedule.details")}</span>
 					<div>{renderModeFields()}</div>
 				</div>
 
@@ -492,7 +494,7 @@ export function ScheduleForm(props: ScheduleFormProps) {
 				</Field>
 
 				<div className="space-y-1.5">
-					<div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted">
+					<div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 text-[10px] font-medium text-muted">
 						<span className="px-2">{t("schedule.sessionTargetShort")}</span>
 						<span className="px-2">{t("schedule.concurrencyShort")}</span>
 						<span className="px-2">{t("schedule.timeoutShort")}</span>
@@ -567,7 +569,7 @@ export function ScheduleForm(props: ScheduleFormProps) {
 					<span
 						className={cn(
 							"rounded-full px-2 py-0.5 text-[11px]",
-							scope === "main" ? "bg-accent/15 text-accent" : "bg-surface-2 text-fg",
+							scope === "main" ? "bg-surface-2 text-accent" : "bg-surface-2 text-fg",
 						)}
 					>
 						{scope === "main" ? t("schedule.scopeMain") : t("schedule.scopeWorkspace")}

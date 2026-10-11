@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { Settings as SettingsIcon, Plus, Folder, MessageSquare, MoreHorizontal, Pin, FolderOpen, Trash2, PanelLeft, Puzzle } from "lucide-react";
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,8 +8,9 @@ import { confirmDialog, alertDialog } from "@/lib/confirm";
 import { BrandIcon } from "./BrandIcon";
 import WorkspacePane from "./WorkspacePane";
 import { UpdateBanner } from "./UpdateBanner";
-import { cn, isTauri, hasMacTrafficLights } from "@/lib/utils";
+import { cn, isTauri, hasMacTrafficLights, isMainChatCwd, samePath, MAIN_CHAT_CWD, pathBasename } from "@/lib/utils";
 import { deleteWorkspace, revealWorkspace } from "@/lib/transport";
+import { useCustomThemes, useThemeId } from "@/lib/theme";
 import { clearComposerDraft } from "@/lib/composer-drafts";
 import { Z } from "@/lib/z-index";
 import type { RpcSessionState, WorkspaceMeta } from "@/lib/types";
@@ -35,8 +36,7 @@ function setPinnedWorkspaces(ids: Set<string>): void {
 }
 
 function basename(path: string): string {
-	const parts = path.replace(/\/+$/, "").split("/");
-	return parts[parts.length - 1] || path;
+	return pathBasename(path);
 }
 
 function timeAgo(ts: number, t: TFunction): string {
@@ -50,13 +50,11 @@ function timeAgo(ts: number, t: TFunction): string {
 	return t("layout.timeDaysAgo", { count: days });
 }
 
-const MAIN_CHAT_CWD = "~/.pizza/main";
-
-function isMainChatCwd(cwd: string | null | undefined): boolean {
-	if (!cwd) return false;
-	if (cwd === MAIN_CHAT_CWD) return true;
-	// Match expanded path like /Users/tom/.pizza/main
-	return cwd.endsWith("/.pizza/main");
+/** True when a `_cwd`-keyed streaming set contains `path` (separator-insensitive). */
+function setHasPath(set: Set<string> | undefined, path: string): boolean {
+	if (!set) return false;
+	for (const p of set) if (samePath(p, path)) return true;
+	return false;
 }
 
 export default function Layout({
@@ -81,6 +79,13 @@ export default function Layout({
 	streamingCwds?: Set<string>;
 }) {
 	const { t } = useTranslation();
+	// Settings takes over the whole window (Codex-style): the app sidebar and
+	// docks are hidden and the settings view provides its own "back to app".
+	const location = useLocation();
+	const isSettingsRoute = location.pathname.startsWith("/settings");
+	const isPluginsActive =
+		location.pathname === "/settings" &&
+		new URLSearchParams(location.search).get("page") === "plugins";
 	// macOS overlay title bar needs left padding so the collapse/expand
 	// buttons clear the traffic lights; other platforms have a normal title
 	// bar and need no reserved space. Evaluated once — platform never changes.
@@ -93,6 +98,9 @@ export default function Layout({
 	}, []);
 	const online = sidecarReady && sidecarExitCode === null;
 	const isMainChat = isMainChatCwd(workspace);
+	// Themes can rebrand the app: web.title/web.icon replace the sidebar brand mark.
+	const themeId = useThemeId();
+	const brandTheme = useCustomThemes().find((ct) => ct.name === themeId);
 	const [pinned, setPinned] = useState<Set<string>>(getPinnedWorkspaces);
 	const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
 	const [collapsed, setCollapsed] = useState<boolean>(() => {
@@ -112,6 +120,7 @@ export default function Layout({
 	const clearHoverTimer = useCallback(() => {
 		if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; }
 	}, []);
+	useEffect(() => clearHoverTimer, [clearHoverTimer]);
 
 	const showSidebar = !collapsed || hovered;
 	const floating = collapsed && hovered;
@@ -185,7 +194,7 @@ export default function Layout({
 	return (
 		<div className="relative flex h-full bg-bg">
 			{/* Expand button — shown only while collapsed, sits in the title bar just right of the macOS traffic lights */}
-			{!showSidebar && (
+			{!isSettingsRoute && !showSidebar && (
 				<button
 					onClick={toggleCollapsed}
 					className={cn(
@@ -199,11 +208,17 @@ export default function Layout({
 				</button>
 			)}
 
-			{/* Left-edge hover strip: reveals the sidebar as a floating overlay while collapsed */}
-			{collapsed && (
+			{/* Left-edge hover strip: reveals the sidebar as a floating overlay while
+			    collapsed — but only after the cursor dwells on the edge (~1s), so a
+			    passing swipe does not pop the menu open. */}
+			{!isSettingsRoute && collapsed && (
 				<div
 					className={cn("fixed inset-y-0 left-0 w-2", Z.overlay)}
-					onMouseEnter={() => { clearHoverTimer(); setHovered(true); }}
+					onMouseEnter={() => {
+						clearHoverTimer();
+						hoverTimerRef.current = setTimeout(() => setHovered(true), 500);
+					}}
+					onMouseLeave={() => clearHoverTimer()}
 				/>
 			)}
 			<aside
@@ -213,15 +228,17 @@ export default function Layout({
 					"flex w-64 flex-col border-r border-border bg-surface transition-all duration-150",
 					floating ? cn("absolute inset-y-0 left-0 shadow-2xl", Z.chrome) : "",
 					!showSidebar ? "pointer-events-none w-0 -translate-x-full overflow-hidden opacity-0" : "",
+					isSettingsRoute && "hidden",
 				)}
 			>
 				{/* Top bar — aligns with the macOS traffic lights; holds the collapse button */}
 				<div
-					data-tauri-drag-region
+					data-tauri-drag-region="deep"
 					className={cn("flex h-11 shrink-0 items-center pr-2", macPad ? "pl-[76px]" : "pl-2")}
 				>
 					<button
 						data-no-drag
+						data-tauri-drag-region="false"
 						onClick={toggleCollapsed}
 						className="flex h-8 w-8 items-center justify-center rounded-lg text-muted/50 transition-colors hover:bg-surface-2 hover:text-muted active:bg-surface-2"
 						title={t("layout.hideSidebar")}
@@ -230,21 +247,25 @@ export default function Layout({
 					</button>
 				</div>
 				<div
-					data-tauri-drag-region
+					data-tauri-drag-region="deep"
 					className="flex items-center gap-3 px-5 pb-2 pt-1"
 				>
-					<BrandIcon size={28} className="shrink-0 text-accent" />
-					<div className="leading-tight" data-tauri-drag-region>
-						<div
-							data-tauri-drag-region
-							className="font-mono text-sm font-bold uppercase tracking-widest text-fg"
-						>
-							pizza
+					{brandTheme?.icon ? (
+						<img
+							src={brandTheme.icon}
+							alt=""
+							width={26}
+							height={26}
+							className="shrink-0 rounded-md object-contain"
+						/>
+					) : (
+						<BrandIcon size={26} className="shrink-0 text-fg" />
+					)}
+					<div className="leading-tight">
+						<div className="text-[15px] font-semibold tracking-tight text-fg">
+							{brandTheme?.title ?? "Pizza"}
 						</div>
-						<div
-							data-tauri-drag-region
-							className="font-mono text-[10px] uppercase tracking-widest text-muted"
-						>
+						<div className="text-[11px] text-muted">
 							{t("layout.brandTagline")}
 						</div>
 					</div>
@@ -254,10 +275,10 @@ export default function Layout({
 					<button
 						onClick={() => onSelectWorkspace?.(MAIN_CHAT_CWD)}
 						className={cn(
-							"flex w-full items-center gap-2 rounded-md border px-2 py-2 text-left transition-colors",
+							"flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
 							isMainChat
-								? "border-accent bg-accent/10"
-								: "border-transparent hover:bg-surface-2",
+								? "bg-surface-2"
+								: "hover:bg-surface-2/60",
 						)}
 						title={t("layout.agentTitle")}
 					>
@@ -270,13 +291,13 @@ export default function Layout({
 						<div className="min-w-0 flex-1">
 							<div
 								className={cn(
-									"truncate font-mono text-xs font-bold uppercase tracking-wide",
-									isMainChat ? "text-accent" : "text-fg",
+									"truncate text-[13px] font-medium",
+									isMainChat ? "text-fg" : "text-fg/90",
 								)}
 							>
 								{t("layout.agent")}
 							</div>
-							<div className="truncate font-mono text-[10px] text-muted">
+							<div className="truncate text-[11px] text-muted">
 								{t("layout.agentSubtitle")}
 							</div>
 						</div>
@@ -284,7 +305,7 @@ export default function Layout({
 							<span
 								className={cn(
 									"h-1.5 w-1.5 shrink-0 rounded-full",
-									state?.isStreaming || streamingCwds?.has(MAIN_CHAT_CWD) ? "bg-accent animate-pulse" : "bg-success",
+									state?.isStreaming || (streamingCwds && [...streamingCwds].some(isMainChatCwd)) ? "bg-accent animate-pulse" : "bg-success",
 								)}
 							/>
 						)}
@@ -294,13 +315,13 @@ export default function Layout({
 				{/* Workspaces section */}
 				<div className="flex-1 overflow-y-auto px-3 py-2">
 					<div className="mb-1 flex items-center justify-between px-2">
-						<span className="font-mono text-[10px] uppercase tracking-widest text-muted">
+						<span className="text-[11px] font-medium text-muted">
 							{t("layout.workspaces")}
 						</span>
 						{isTauri() && (
 							<button
 								onClick={() => onNewWorkspace?.()}
-								className="text-muted hover:text-accent transition-colors"
+								className="text-muted transition-colors hover:text-fg"
 								title={t("layout.newWorkspaceTitle")}
 							>
 								<Plus className="h-3.5 w-3.5" />
@@ -310,7 +331,7 @@ export default function Layout({
 					{sortedWorkspaces.length > 0 ? (
 						<div className="space-y-0.5">
 							{sortedWorkspaces.map((ws) => {
-								const isActive = workspace === ws.cwd;
+								const isActive = samePath(workspace, ws.cwd);
 								const isPinned = pinned.has(ws.workspace_id);
 								const isMenuOpen = menuOpenId === ws.workspace_id;
 								return (
@@ -328,10 +349,10 @@ export default function Layout({
 												onSelectWorkspace?.(ws.cwd);
 											}}
 											className={cn(
-												"flex w-full cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-left transition-colors",
+												"flex w-full cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors",
 												isActive
-													? "border-accent bg-accent/10"
-													: "border-transparent hover:bg-surface-2",
+													? "bg-surface-2"
+													: "hover:bg-surface-2/60",
 												ws.dir_exists === false && "opacity-60",
 											)}
 											title={ws.dir_exists === false ? t("layout.staleWorkspaceTitle", { cwd: ws.cwd }) : ws.cwd}
@@ -344,20 +365,20 @@ export default function Layout({
 											<div className="min-w-0 flex-1">
 												<div
 													className={cn(
-														"truncate font-mono text-xs",
-														isActive ? "text-accent" : "text-fg",
+														"truncate text-[13px]",
+														isActive ? "font-medium text-fg" : "text-fg/90",
 													)}
 												>
 													{basename(ws.cwd)}
 													{ws.dir_exists === false && (
-														<span className="ml-1 text-[10px] uppercase tracking-wide text-warning">{t("layout.staleWorkspaceBadge")}</span>
+														<span className="ml-1 text-[10px] font-medium text-warning">{t("layout.staleWorkspaceBadge")}</span>
 													)}
 												</div>
-												<div className="truncate font-mono text-[10px] text-muted">
+												<div className="truncate text-[11px] text-muted">
 													{timeAgo(ws.last_accessed_at, t)}
 												</div>
 											</div>
-											{online && (isActive || streamingCwds?.has(ws.cwd)) && (
+											{online && (isActive || setHasPath(streamingCwds, ws.cwd)) && (
 												<span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", (isActive ? state?.isStreaming : true) ? "bg-accent animate-pulse" : "bg-success")} />
 											)}
 											<MoreMenu
@@ -378,7 +399,7 @@ export default function Layout({
 						</div>
 					) : (
 						<div className="px-2 py-4 text-center">
-							<p className="font-mono text-[10px] text-muted">{t("layout.noWorkspaces")}</p>
+							<p className="text-xs text-muted">{t("layout.noWorkspaces")}</p>
 						</div>
 					)}
 				</div>
@@ -392,21 +413,21 @@ export default function Layout({
 				{/* Plugins nav */}
 				<div className="border-t border-border px-3 pt-2 pb-1">
 					<NavLink
-						to="/plugins"
+						to="/settings?page=plugins"
 						className={({ isActive }) => cn(
-							"flex w-full items-center gap-2 rounded-md border px-2 py-2 text-left transition-colors",
+							"flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
 							isActive
-								? "border-accent bg-accent/10"
-								: "border-transparent hover:bg-surface-2",
+								? "bg-surface-2"
+								: "hover:bg-surface-2/60",
 						)}
 						title={t("plugins.title")}
 					>
-						<Puzzle className={cn("h-4 w-4 shrink-0 text-muted")} />
+						<Puzzle className={cn("h-4 w-4 shrink-0", isPluginsActive ? "text-accent" : "text-muted")} />
 						<div className="min-w-0 flex-1">
-							<div className="truncate font-mono text-xs font-bold uppercase tracking-wide text-fg">
+							<div className={cn("truncate text-[13px]", isPluginsActive ? "font-medium text-fg" : "font-medium text-fg/90")}>
 								{t("layout.plugins")}
 							</div>
-							<div className="truncate font-mono text-[10px] text-muted">
+							<div className="truncate text-[11px] text-muted">
 								{t("layout.pluginsSubtitle")}
 							</div>
 						</div>
@@ -416,13 +437,13 @@ export default function Layout({
 				<div className="border-t border-border px-3 py-3">
 
 					<div className="flex items-center justify-between rounded-md px-2 py-1.5">
-						<div className="flex items-center gap-2 font-mono text-xs">
+						<div className="flex items-center gap-2 text-xs">
 							{online && state?.isStreaming ? (
 								<span className="h-2 w-2 shrink-0 rounded-full bg-accent animate-pulse" />
 							) : (
 								<StatusDot tone={online ? "success" : "danger"} />
 							)}
-							<span className="uppercase tracking-wide text-fg">
+							<span className="text-muted">
 								{online ? (state?.isStreaming ? t("layout.statusRunning") : t("layout.statusOnline")) : t("layout.statusOffline")}
 							</span>
 						</div>
@@ -437,9 +458,15 @@ export default function Layout({
 			<main className="flex min-w-0 flex-1 flex-col overflow-hidden">
 				<UpdateBanner />
 				<div className="min-h-0 flex-1">
-				<WorkspacePane workspace={workspace} ptyPort={state?.ptyPort}>
-					<Outlet context={{ sidebarCollapsed: collapsed } satisfies LayoutOutletContext} />
-				</WorkspacePane>
+				{isSettingsRoute ? (
+					/* Full-bleed settings: no right/bottom docks, top bar clears the
+					   traffic lights itself (sidebarCollapsed=true in the context). */
+					<Outlet context={{ sidebarCollapsed: true } satisfies LayoutOutletContext} />
+				) : (
+					<WorkspacePane workspace={workspace} ptyPort={state?.ptyPort}>
+						<Outlet context={{ sidebarCollapsed: collapsed } satisfies LayoutOutletContext} />
+					</WorkspacePane>
+				)}
 				</div>
 			</main>
 		</div>

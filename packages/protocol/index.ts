@@ -20,7 +20,8 @@
  * Two layers of scheduling are supported:
  *   - "visual" modes: every_n_minutes / every_n_hours / daily / weekdays /
  *     weekly / monthly. Each "time" field is an array so multiple time
- *     points are first-class (e.g. "每天 02:00 和 03:00").
+ *     points are first-class (e.g. "every day at 02:00 and 03:00" /
+ *     "每天 02:00 和 03:00").
  *   - "advanced" mode: cron expression with optional timezone.
  *
  * The two layers are equivalent at runtime: any visual schedule can be
@@ -161,6 +162,15 @@ export interface SchedulerPolicy {
 	defaultSessionTarget: SessionTarget;
 }
 
+/** Network settings (settings.json `network`) — outbound egress for channel
+ *  adapters and other integrations. */
+export interface NetworkSettings {
+	/** Proxy for outbound connections. "auto" (default/absent): env vars, then
+	 *  OS proxy detection. "off": direct connections. Otherwise an explicit URL
+	 *  like "http://127.0.0.1:7897" or "socks5://…". */
+	proxy?: string;
+}
+
 /** Lightweight status snapshot returned to UI when listing tasks. */
 export interface ScheduledTaskSummary extends ScheduledTask {
 	/** Next scheduled fire time, or null if disabled / past endAt. */
@@ -231,7 +241,8 @@ export type RpcCommand =
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model" }
-	| { id?: string; type: "get_available_models" }
+	/** authOnly: return only models with configured auth (the registry holds ~1.6k models, ~260KB). */
+	| { id?: string; type: "get_available_models"; authOnly?: boolean }
 
 	// Thinking
 	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
@@ -289,16 +300,25 @@ export type RpcCommand =
 	| { id?: string; type: "get_skills" }
 	| { id?: string; type: "set_skill_enabled"; skillName: string; enabled: boolean }
 	| { id?: string; type: "delete_skill"; skillName: string }
+	| { id?: string; type: "install_skill"; source: string; slug: string }
 	| { id?: string; type: "get_extensions" }
+	| { id?: string; type: "get_themes" }
 	| { id?: string; type: "set_extension_enabled"; extensionId: string; enabled: boolean }
 	| { id?: string; type: "install_extension"; extensionId: string }
 	| { id?: string; type: "uninstall_extension"; extensionId: string }
+	| { id?: string; type: "install_package"; source: string }
+	| { id?: string; type: "remove_package"; source: string }
+	| { id?: string; type: "get_extension_permissions"; extensionId: string }
+	| { id?: string; type: "recheck_extension_permissions"; extensionId: string }
+	| { id?: string; type: "open_extension_permission_settings"; extensionId: string; permissionKind: RpcExtensionPermissionKind }
 	// Provider auth: reload in-memory credentials from auth.json (used after the
 	// desktop bridge edits auth.json out-of-band, so a model switch picks up the
 	// new key instead of the stale in-memory cache or an env-var fallback).
 	| { id?: string; type: "reload_providers" }
 	| { id?: string; type: "get_scheduler_policy" }
 	| { id?: string; type: "set_scheduler_policy"; policy: SchedulerPolicy }
+	| { id?: string; type: "get_network" }
+	| { id?: string; type: "set_network"; network: NetworkSettings }
 
 	// Scheduled tasks
 	| { id?: string; type: "schedule_list"; scope: "main" | "workspace"; workspaceId?: string }
@@ -351,6 +371,8 @@ export interface RpcSlashCommand {
 	description?: string;
 	/** What kind of command this is */
 	source: "extension" | "prompt" | "skill";
+	/** Hint for expected arguments (prompt templates only) */
+	argumentHint?: string;
 	/** Source metadata for the owning resource */
 	sourceInfo: unknown;
 }
@@ -385,8 +407,14 @@ export interface RpcExtensionInfo {
 	kind: "builtin" | "user" | "project" | "cli" | "package";
 	/** Whether the extension is currently active (loaded). Disabled built-ins report false. */
 	enabled: boolean;
-	/** Whether toggling enable/disable is supported (currently only built-in extensions). */
+	/** Whether toggling enable/disable is supported (built-ins and installed plugin packages). */
 	canToggle: boolean;
+	/**
+	 * For extensions from an installed plugin package: the package source. Pass
+	 * it (not `id`) to set_extension_enabled / remove_package — packages toggle
+	 * and uninstall as a whole.
+	 */
+	packageSource?: string;
 	/** Whether this extension ships an external dependency (e.g. a CLI binary) that can be installed/uninstalled. */
 	installable: boolean;
 	/** Whether the external dependency is currently installed. Only meaningful when installable is true. */
@@ -399,6 +427,61 @@ export interface RpcExtensionInfo {
 	commandCount: number;
 	/** Number of dynamic built-in cli commands this extension registers (e.g. computer-use's `_computer_use`). */
 	builtinCommandCount: number;
+	/**
+	 * For package extensions: extension load errors attributed to this package
+	 * (e.g. a pi-marketplace package importing APIs the runtime doesn't have).
+	 * Absent when the package loaded cleanly.
+	 */
+	loadError?: string;
+}
+
+/** A theme known to the agent (built-in, user dir, or extension-contributed), as returned by get_themes. */
+export interface RpcThemeInfo {
+	/** Theme name (unique key). */
+	name: string;
+	/** Display label for UI pickers (defaults to name). */
+	label?: string;
+	/** Absolute path of the theme JSON, when loaded from disk. */
+	path?: string;
+	/** Where the theme comes from (e.g. "builtin", "user", an extension/package name). */
+	source?: string;
+	/** Whether the theme ships with Pizza. */
+	builtin: boolean;
+	/** Resolved web/desktop UI contribution, when the theme provides one. */
+	web?: {
+		label?: string;
+		mode: "light" | "dark";
+		/** CSS custom-property overrides keyed without the "--" prefix. */
+		tokens: Record<string, string>;
+		/** Window/document title and app brand name shown while this theme is active. */
+		title?: string;
+		/** App icon (favicon, window icon, sidebar brand mark) as a data: URI. */
+		icon?: string;
+		/** Raw CSS injected only while this theme is active (background images, animations, ...). */
+		css?: string;
+		/** Background video as a data: URI — plays muted+looping behind app content. */
+		video?: string;
+	};
+}
+
+export type RpcExtensionPermissionKind = "accessibility" | "screenRecording";
+
+export interface RpcExtensionPermissionInfo {
+	kind: RpcExtensionPermissionKind;
+	label: string;
+	description: string;
+	granted: boolean;
+	required: boolean;
+}
+
+export interface RpcExtensionPermissionState {
+	extensionId: string;
+	supported: boolean;
+	installed: boolean;
+	ready: boolean;
+	helperPath?: string;
+	message?: string;
+	permissions: RpcExtensionPermissionInfo[];
 }
 
 // ============================================================================
@@ -476,7 +559,7 @@ export type RpcResponse =
 	// Model
 	| { id?: string; type: "response"; command: "set_model"; success: true; data: ModelInfo }
 	| { id?: string; type: "response"; command: "cycle_model"; success: true; data: { model: ModelInfo; thinkingLevel: ThinkingLevel; isScoped: boolean } | null }
-	| { id?: string; type: "response"; command: "get_available_models"; success: true; data: { models: ModelInfo[] } }
+	| { id?: string; type: "response"; command: "get_available_models"; success: true; data: { models: ModelInfo[]; total: number } }
 
 	// Thinking
 	| { id?: string; type: "response"; command: "set_thinking_level"; success: true }
@@ -534,13 +617,22 @@ export type RpcResponse =
 			data: { name: string; enabled: boolean; requiresReload: boolean };
 	  }
 	| { id?: string; type: "response"; command: "delete_skill"; success: true; data: { name: string } }
+	| { id?: string; type: "response"; command: "install_skill"; success: true; data: { name: string; path: string } }
 	| { id?: string; type: "response"; command: "get_extensions"; success: true; data: { extensions: RpcExtensionInfo[] } }
+	| { id?: string; type: "response"; command: "get_themes"; success: true; data: { themes: RpcThemeInfo[] } }
 	| { id?: string; type: "response"; command: "set_extension_enabled"; success: true; data: { id: string; enabled: boolean; requiresReload: boolean } }
 	| { id?: string; type: "response"; command: "install_extension"; success: true; data: { extensionId: string; ok: boolean; message: string; installed: boolean } }
 	| { id?: string; type: "response"; command: "uninstall_extension"; success: true; data: { extensionId: string; ok: boolean; message: string; installed: boolean } }
+	| { id?: string; type: "response"; command: "install_package"; success: true; data: { source: string; installed: boolean; requiresReload: boolean } }
+	| { id?: string; type: "response"; command: "remove_package"; success: true; data: { source: string; removed: boolean; requiresReload: boolean } }
+	| { id?: string; type: "response"; command: "get_extension_permissions"; success: true; data: RpcExtensionPermissionState }
+	| { id?: string; type: "response"; command: "recheck_extension_permissions"; success: true; data: RpcExtensionPermissionState }
+	| { id?: string; type: "response"; command: "open_extension_permission_settings"; success: true; data: { extensionId: string; ok: boolean; message: string } }
 	| { id?: string; type: "response"; command: "reload_providers"; success: true; data: { providers: string[] } }
 	| { id?: string; type: "response"; command: "get_scheduler_policy"; success: true; data: { policy: SchedulerPolicy } }
 	| { id?: string; type: "response"; command: "set_scheduler_policy"; success: true; data: { policy: SchedulerPolicy } }
+	| { id?: string; type: "response"; command: "get_network"; success: true; data: { network: NetworkSettings } }
+	| { id?: string; type: "response"; command: "set_network"; success: true; data: { network: NetworkSettings } }
 
 	// Scheduled tasks
 	| { id?: string; type: "response"; command: "schedule_list"; success: true; data: { tasks: ScheduledTaskSummary[] } }
@@ -644,7 +736,7 @@ export type RpcExtensionUIResponse =
 
 // Well-known event types emitted by the scheduler. The UI subscribes to
 // these over the rpc_event stream so it can update task status, history,
-// and the "⏰ 已触发" notice card in real time.
+// and the "⏰ task fired" notice card in real time.
 export const SCHEDULED_TASK_FIRED = "SCHEDULED_TASK_FIRED";
 export const SCHEDULED_TASK_COMPLETED = "SCHEDULED_TASK_COMPLETED";
 export const SCHEDULE_INTENT_RESOLVED = "SCHEDULE_INTENT_RESOLVED";

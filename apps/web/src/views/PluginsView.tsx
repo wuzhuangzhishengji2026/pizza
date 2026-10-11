@@ -1,25 +1,35 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { useNavigate, useLocation, useOutletContext } from "react-router-dom";
-import { PageHeader, Card, Badge, Button, MoreMenu } from "@/components/ui";
+import { Card, Badge, Button, MoreMenu, type ContextMenuItem } from "@/components/ui";
 import { confirmDialog } from "@/lib/confirm";
-import { cn } from "@/lib/utils";
+import { cn, isMainChatCwd, pathBasename } from "@/lib/utils";
 import {
 	fetchSkillsSh,
+	getCachedSkillsSh,
 	getSkills,
 	setSkillEnabled,
 	deleteSkill,
+	installSkill,
 	getExtensions,
 	setExtensionEnabled,
 	installExtension,
 	uninstallExtension,
+	installPluginPackage,
+	removePackage,
+	fetchPiPackages,
+	getCachedPiPackages,
+	getExtensionPermissions,
+	recheckExtensionPermissions,
+	openExtensionPermissionSettings,
 	openExternal,
 	type SkillsShSkill,
 	type SkillInfo,
 	type ExtensionInfo,
+	type PiPackage,
+	type ExtensionPermissionKind,
+	type ExtensionPermissionState,
 } from "@/lib/transport";
-import { ArrowLeft, ArrowRight, Puzzle, BookOpen, Radio, Settings, Plus, Search, ExternalLink, Download, Power, Trash2, Hash, Send } from "lucide-react";
-import type { LayoutOutletContext } from "@/components/Layout";
+import { Puzzle, BookOpen, Radio, Settings, Plus, Search, ExternalLink, Download, Power, Trash2, Hash, Send, Monitor, MousePointer2, RotateCw, ShieldCheck, Loader2 } from "lucide-react";
 import { ChannelDialog } from "@/components/ChannelDialog";
 import {
 	listChannels,
@@ -30,6 +40,8 @@ import {
 } from "@/lib/channels";
 
 type PluginTab = "skills" | "extensions" | "channels";
+const PERMISSION_CHECK_SLOW_MS = 6000;
+const PERMISSION_OPEN_BUSY_MS = 3000;
 
 interface TabConfig {
 	key: PluginTab;
@@ -41,6 +53,21 @@ const TABS: TabConfig[] = [
 	{ key: "extensions", icon: Puzzle },
 	{ key: "channels", icon: Radio },
 ];
+
+function permissionFallbackState(
+	extensionId: string,
+	installed: boolean,
+	message: string,
+): ExtensionPermissionState {
+	return {
+		extensionId,
+		supported: true,
+		installed,
+		ready: false,
+		message,
+		permissions: [],
+	};
+}
 
 function InstalledSkillCard({
 	skill,
@@ -109,10 +136,19 @@ function InstalledSkillCard({
 	);
 }
 
-function DirectorySkillCard({ skill, installed }: { skill: SkillsShSkill; installed: boolean }) {
+function DirectorySkillCard({
+	skill,
+	installed,
+	installing,
+	onInstall,
+}: {
+	skill: SkillsShSkill;
+	installed: boolean;
+	installing: boolean;
+	onInstall: () => void;
+}) {
 	const { t } = useTranslation();
 	const view = () => openExternal(skill.url);
-	const install = () => openExternal(skill.installUrl ?? skill.url);
 	return (
 		<Card className="@container transition-colors hover:border-accent/40">
 			<div className="flex flex-col gap-3 @sm:flex-row @sm:items-start @sm:justify-between">
@@ -125,6 +161,8 @@ function DirectorySkillCard({ skill, installed }: { skill: SkillsShSkill; instal
 					<div className="mt-3 flex flex-wrap items-center gap-2">
 						{installed ? (
 							<Badge tone="success">{t("plugins.skills.installed")}</Badge>
+						) : installing ? (
+							<Badge tone="accent">{t("plugins.skills.installing")}</Badge>
 						) : (
 							<Badge tone="accent">{t("plugins.skills.type")}</Badge>
 						)}
@@ -135,7 +173,16 @@ function DirectorySkillCard({ skill, installed }: { skill: SkillsShSkill; instal
 						title={t("plugins.skills.actions")}
 						items={[
 							{ icon: ExternalLink, label: t("plugins.skills.view"), onClick: view },
-							...(installed ? [] : [{ icon: Download, label: t("plugins.skills.install"), onClick: install }]),
+							...(installed
+								? []
+								: [
+										{
+											icon: installing ? Loader2 : Download,
+											label: installing ? t("plugins.skills.installing") : t("plugins.skills.install"),
+											onClick: onInstall,
+											disabled: installing,
+										},
+									]),
 						]}
 					/>
 				</div>
@@ -146,9 +193,9 @@ function DirectorySkillCard({ skill, installed }: { skill: SkillsShSkill; instal
 
 function SkillsTab() {
 	const { t } = useTranslation();
-	const [dirSkills, setDirSkills] = useState<SkillsShSkill[]>([]);
+	const [dirSkills, setDirSkills] = useState<SkillsShSkill[]>(() => getCachedSkillsSh() ?? []);
 	const [installedSkills, setInstalledSkills] = useState<SkillInfo[]>([]);
-	const [loading, setLoading] = useState(true);
+	const [loading, setLoading] = useState(() => dirSkills.length === 0);
 	const [error, setError] = useState("");
 	const [search, setSearch] = useState("");
 
@@ -209,6 +256,27 @@ function SkillsTab() {
 		}
 	}, [t]);
 
+	const [installingId, setInstallingId] = useState<string | null>(null);
+	const [installedIds, setInstalledIds] = useState<Set<string>>(() => new Set());
+	const [actionError, setActionError] = useState("");
+
+	const handleInstall = useCallback(async (skill: SkillsShSkill) => {
+		setInstallingId(skill.id);
+		setActionError("");
+		try {
+			await installSkill(skill.source, skill.slug);
+			// The skills.sh slug may differ from the skill's frontmatter name —
+			// track the directory id too so the card settles on "installed"
+			// even when the refreshed installed list names it differently.
+			setInstalledIds((prev) => new Set(prev).add(skill.id));
+			setInstalledSkills(await getSkills());
+		} catch (e) {
+			setActionError(e instanceof Error ? e.message : String(e));
+		} finally {
+			setInstallingId(null);
+		}
+	}, []);
+
 	const installedNames = new Set(installedSkills.map((s) => s.name));
 	const filteredDir = search.trim()
 		? dirSkills.filter(
@@ -266,6 +334,12 @@ function SkillsTab() {
 				</Card>
 			)}
 
+			{actionError && (
+				<Card>
+					<p className="text-xs text-danger">{t("plugins.skills.installError", { error: actionError })}</p>
+				</Card>
+			)}
+
 			{filteredLocal.length > 0 && (
 				<>
 					<h2 className="mb-3 text-sm font-semibold text-fg">
@@ -303,7 +377,9 @@ function SkillsTab() {
 						<DirectorySkillCard
 							key={skill.id}
 							skill={skill}
-							installed={installedNames.has(skill.slug)}
+							installed={installedNames.has(skill.slug) || installedIds.has(skill.id)}
+							installing={installingId === skill.id}
+							onInstall={() => void handleInstall(skill)}
 						/>
 					))}
 				</div>
@@ -317,23 +393,63 @@ function ExtensionCard({
 	onToggle,
 	onInstall,
 	onUninstall,
+	permissionState,
+	permissionBusy,
+	onOpenPermission,
+	onRecheckPermissions,
+	onRemovePackage,
 	busyId,
 }: {
 	ext: ExtensionInfo;
 	onToggle: (id: string, enabled: boolean) => void;
 	onInstall: (id: string) => void;
 	onUninstall: (id: string) => void;
+	permissionState?: ExtensionPermissionState;
+	permissionBusy: string | null;
+	onOpenPermission: (id: string, kind: ExtensionPermissionKind) => void;
+	onRecheckPermissions: (id: string) => void;
+	onRemovePackage: (source: string) => void;
 	busyId: string | null;
 }) {
 	const { t } = useTranslation();
 	const kindLabel = t(`plugins.extensions.${ext.kind}`);
-	const busy = busyId === ext.id;
+	const busy = busyId === ext.id || (ext.packageSource !== undefined && busyId === ext.packageSource);
 	// An installable extension that hasn't had its external dependency installed
 	// is not yet usable — only offer Install, and hide the enabled/disabled badge
 	// and toggle to avoid implying the extension is operational.
 	const notInstalledInstallable = ext.installable && !ext.installed;
 	const showToggle = ext.canToggle && !notInstalledInstallable;
 	const showEnabledBadge = !notInstalledInstallable;
+	const showPermissionGuide = ext.id === "computer-use" && ext.installable && ext.installed;
+	const menuItems: ContextMenuItem[] = [
+		...(ext.installable
+			? [{
+					icon: ext.installed ? Trash2 : Download,
+					label: busy
+						? (ext.installed ? t("plugins.extensions.uninstalling") : t("plugins.extensions.installing"))
+						: (ext.installed ? t("plugins.extensions.uninstall") : t("plugins.extensions.install")),
+					disabled: busy,
+					onClick: () => (ext.installed ? onUninstall(ext.id) : onInstall(ext.id)),
+				}]
+			: []),
+		...(showToggle
+			? [{
+					icon: Power,
+					label: ext.enabled ? t("plugins.extensions.disable") : t("plugins.extensions.enable"),
+					disabled: busy,
+					// Packages toggle/remove as a whole via their source.
+					onClick: () => onToggle(ext.packageSource ?? ext.id, !ext.enabled),
+				}]
+			: []),
+		...(ext.kind === "package"
+			? [{
+					icon: Trash2,
+					label: busy ? t("plugins.extensions.uninstalling") : t("plugins.extensions.uninstall"),
+					disabled: busy,
+					onClick: () => onRemovePackage(ext.packageSource ?? ext.id),
+				}]
+			: []),
+	];
 	return (
 		<Card className="@container transition-colors hover:border-accent/40">
 			<div className="flex flex-col gap-3 @sm:flex-row @sm:items-start @sm:justify-between">
@@ -353,6 +469,9 @@ function ExtensionCard({
 								<Badge tone="neutral">{t("plugins.extensions.disabled")}</Badge>
 							))}
 						<Badge tone="neutral">{kindLabel}</Badge>
+						{ext.loadError && (
+							<Badge tone="danger">{t("plugins.extensions.loadFailed")}</Badge>
+						)}
 						{ext.installable && (
 							<Badge tone={ext.installed ? "success" : "warning"}>
 								{ext.installed ? t("plugins.extensions.installed") : t("plugins.extensions.notInstalled")}
@@ -374,30 +493,104 @@ function ExtensionCard({
 							</span>
 						)}
 					</div>
+					{ext.loadError && (
+						<p className="mt-2 line-clamp-2 font-mono text-[10px] leading-relaxed text-danger">
+							{ext.loadError}
+						</p>
+					)}
+				</div>
+				<div className="flex shrink-0 items-center gap-2">
+					{menuItems.length > 0 && (
+						<MoreMenu
+							disabled={busy}
+							title={t("plugins.extensions.actions")}
+							items={menuItems}
+						/>
+					)}
+				</div>
+			</div>
+			{showPermissionGuide && (
+				<ExtensionPermissionGuide
+					extensionId={ext.id}
+					state={permissionState}
+					busy={permissionBusy}
+					onOpen={(kind) => onOpenPermission(ext.id, kind)}
+					onRecheck={() => onRecheckPermissions(ext.id)}
+				/>
+			)}
+		</Card>
+	);
+}
+
+function PiPackageCard({
+	pkg,
+	installed,
+	failed,
+	installing,
+	onInstall,
+}: {
+	pkg: PiPackage;
+	installed: boolean;
+	/** Installed but failed to load (e.g. uses APIs pizza doesn't provide). */
+	failed: boolean;
+	installing: boolean;
+	onInstall: () => void;
+}) {
+	const { t } = useTranslation();
+	const links = [
+		{ icon: ExternalLink, label: t("plugins.extensions.directory.view"), onClick: () => openExternal(pkg.url) },
+		...(pkg.npmUrl
+			? [{ icon: ExternalLink, label: t("plugins.extensions.directory.npm"), onClick: () => openExternal(pkg.npmUrl!) }]
+			: []),
+		...(pkg.repoUrl
+			? [{ icon: ExternalLink, label: t("plugins.extensions.directory.repo"), onClick: () => openExternal(pkg.repoUrl!) }]
+			: []),
+	];
+	return (
+		<Card className="@container transition-colors hover:border-accent/40">
+			<div className="flex flex-col gap-3 @sm:flex-row @sm:items-start @sm:justify-between">
+				<div className="min-w-0 flex-1">
+					<div className="flex items-center gap-2">
+						<Puzzle className="h-4 w-4 shrink-0 text-accent" />
+						<span className="truncate text-sm font-medium text-fg">{pkg.name}</span>
+					</div>
+					{pkg.description && (
+						<p className="mt-2 line-clamp-2 text-xs text-muted">{pkg.description}</p>
+					)}
+					<div className="mt-3 flex flex-wrap items-center gap-2">
+						{installed && failed ? (
+							<Badge tone="danger">{t("plugins.extensions.loadFailed")}</Badge>
+						) : installed ? (
+							<Badge tone="success">{t("plugins.extensions.directory.installed")}</Badge>
+						) : installing ? (
+							<Badge tone="accent">{t("plugins.extensions.directory.installing")}</Badge>
+						) : (
+							<Badge tone="accent">pi</Badge>
+						)}
+						{pkg.author && <Badge tone="neutral">{pkg.author}</Badge>}
+						{pkg.downloadsLabel && (
+							<span className="text-[10px] text-muted">{pkg.downloadsLabel}</span>
+						)}
+					</div>
 				</div>
 				<div className="flex shrink-0 items-center gap-2">
 					<MoreMenu
-						disabled={busy}
 						title={t("plugins.extensions.actions")}
 						items={[
-							...(ext.installable
-								? [{
-										icon: ext.installed ? Trash2 : Download,
-										label: busy
-											? (ext.installed ? t("plugins.extensions.uninstalling") : t("plugins.extensions.installing"))
-											: (ext.installed ? t("plugins.extensions.uninstall") : t("plugins.extensions.install")),
-										disabled: busy,
-										onClick: () => (ext.installed ? onUninstall(ext.id) : onInstall(ext.id)),
-									}]
-								: []),
-							...(showToggle
-								? [{
-										icon: Power,
-										label: ext.enabled ? t("plugins.extensions.disable") : t("plugins.extensions.enable"),
-										disabled: busy,
-										onClick: () => onToggle(ext.id, !ext.enabled),
-									}]
-								: []),
+							...links,
+							...(installed
+								? []
+								: [
+										{ divider: true as const },
+										{
+											icon: installing ? Loader2 : Download,
+											label: installing
+												? t("plugins.extensions.directory.installing")
+												: t("plugins.extensions.directory.install"),
+											onClick: onInstall,
+											disabled: installing,
+										},
+									]),
 						]}
 					/>
 				</div>
@@ -406,25 +599,208 @@ function ExtensionCard({
 	);
 }
 
+function ExtensionPermissionGuide({
+	extensionId,
+	state,
+	busy,
+	onOpen,
+	onRecheck,
+}: {
+	extensionId: string;
+	state?: ExtensionPermissionState;
+	busy: string | null;
+	onOpen: (kind: ExtensionPermissionKind) => void;
+	onRecheck: () => void;
+}) {
+	const { t } = useTranslation();
+	const permissions = state?.permissions.length
+		? state.permissions
+		: [
+				{ kind: "accessibility" as const, label: "Accessibility", description: "", granted: false, required: true },
+				{ kind: "screenRecording" as const, label: "Screen Recording", description: "", granted: false, required: true },
+			];
+	const checking = !state;
+	const ready = state?.ready === true;
+	const missing = permissions.filter((permission) => permission.required && !permission.granted);
+	const busyRecheck = busy === `${extensionId}:recheck`;
+
+	return (
+		<div className={cn(
+			"mt-4 rounded-lg border px-3 py-3",
+			ready ? "border-success/30 bg-success/5" : "border-warning/30 bg-warning/5",
+		)}>
+			<div className="flex flex-col gap-2 @sm:flex-row @sm:items-center @sm:justify-between">
+				<div className="min-w-0">
+					<div className="flex items-center gap-2 text-xs font-medium text-fg">
+						<ShieldCheck className={cn("h-3.5 w-3.5", ready ? "text-success" : "text-warning")} />
+						<span>
+							{checking
+								? t("plugins.extensions.permissions.checking")
+								: ready
+									? t("plugins.extensions.permissions.ready")
+									: t("plugins.extensions.permissions.needsSetup")}
+						</span>
+					</div>
+					{state?.message && (
+						<p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-muted">{state.message}</p>
+					)}
+				</div>
+				<Button
+					size="sm"
+					tone="neutral"
+					variant="outline"
+					iconLeft={<RotateCw className="h-3.5 w-3.5" />}
+					loading={busyRecheck}
+					disabled={busy !== null || checking}
+					onClick={onRecheck}
+				>
+					{t("plugins.extensions.permissions.recheck")}
+				</Button>
+			</div>
+			<div className="mt-3 space-y-2">
+				{permissions.map((permission) => {
+					const Icon = permission.kind === "screenRecording" ? Monitor : MousePointer2;
+					const rowBusy = busy === `${extensionId}:${permission.kind}`;
+					return (
+						<div
+							key={permission.kind}
+							className="flex flex-col gap-2 rounded-md border border-border/70 bg-surface/70 px-3 py-2 @sm:flex-row @sm:items-center @sm:justify-between"
+						>
+							<div className="min-w-0">
+								<div className="flex items-center gap-2">
+									<Icon className="h-3.5 w-3.5 shrink-0 text-muted" />
+									<span className="text-xs font-medium text-fg">
+										{t(`plugins.extensions.permissions.${permission.kind}`)}
+									</span>
+									<Badge tone={permission.granted ? "success" : "warning"}>
+										{checking
+											? t("plugins.extensions.permissions.detecting")
+											: permission.granted
+											? t("plugins.extensions.permissions.granted")
+											: t("plugins.extensions.permissions.missing")}
+									</Badge>
+								</div>
+								<p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-muted">
+									{t(`plugins.extensions.permissions.${permission.kind}Hint`)}
+								</p>
+							</div>
+							{!checking && !permission.granted && (
+								<Button
+									size="sm"
+									tone="accent"
+									variant="soft"
+									iconRight={<ExternalLink className="h-3.5 w-3.5" />}
+									loading={rowBusy}
+									disabled={busy !== null}
+									onClick={() => onOpen(permission.kind)}
+								>
+									{t("plugins.extensions.permissions.openSettings")}
+								</Button>
+							)}
+						</div>
+					);
+				})}
+			</div>
+			{!checking && missing.length > 0 && (
+				<p className="mt-2 text-[11px] leading-relaxed text-muted">
+					{t("plugins.extensions.permissions.afterOpen")}
+				</p>
+			)}
+		</div>
+	);
+}
+
+/** Extract the npm package name from an installed package source ("npm:foo@1.2.3" -> "foo"). */
+function packageSourceNpmName(source: string | undefined): string | null {
+	if (!source || !source.startsWith("npm:")) return null;
+	const spec = source.slice(4);
+	// Scoped names contain one slash; strip a trailing @version unless it's the scope prefix.
+	const at = spec.lastIndexOf("@");
+	return at > 0 ? spec.slice(0, at) : spec;
+}
+
 function ExtensionsTab() {
 	const { t } = useTranslation();
 	const [extensions, setExtensions] = useState<ExtensionInfo[]>([]);
+	const [extensionPermissions, setExtensionPermissions] = useState<Record<string, ExtensionPermissionState>>({});
+	const [dirPackages, setDirPackages] = useState<PiPackage[]>(() => getCachedPiPackages() ?? []);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
 	const [reloadHint, setReloadHint] = useState(false);
+	const [permissionBusy, setPermissionBusy] = useState<string | null>(null);
+	const [search, setSearch] = useState("");
+	const [installingName, setInstallingName] = useState<string | null>(null);
+	const [installedNames, setInstalledNames] = useState<Set<string>>(() => new Set());
+	const permissionRequestSeq = useRef(0);
+
+	const refreshPermissions = useCallback(async (exts: ExtensionInfo[]) => {
+		const permissionExts = exts.filter((ext) => ext.id === "computer-use" && ext.installable && ext.installed);
+		if (permissionExts.length === 0) {
+			setExtensionPermissions({});
+			return;
+		}
+		const ids = new Set(permissionExts.map((ext) => ext.id));
+		setExtensionPermissions((prev) => Object.fromEntries(
+			Object.entries(prev).filter(([id]) => ids.has(id)),
+		));
+		for (const ext of permissionExts) {
+			const requestId = ++permissionRequestSeq.current;
+			let settled = false;
+			const timeout = window.setTimeout(() => {
+				if (settled || permissionRequestSeq.current !== requestId) return;
+				setExtensionPermissions((prev) => ({
+					...prev,
+					[ext.id]: permissionFallbackState(
+						ext.id,
+						ext.installed,
+						t("plugins.extensions.permissions.checkSlow"),
+					),
+				}));
+			}, PERMISSION_CHECK_SLOW_MS);
+			void getExtensionPermissions(ext.id)
+				.then((result) => {
+					settled = true;
+					window.clearTimeout(timeout);
+					if (permissionRequestSeq.current !== requestId) return;
+					setExtensionPermissions((prev) => ({ ...prev, [ext.id]: result }));
+				})
+				.catch((e) => {
+					settled = true;
+					window.clearTimeout(timeout);
+					if (permissionRequestSeq.current !== requestId) return;
+					setExtensionPermissions((prev) => ({
+						...prev,
+						[ext.id]: permissionFallbackState(
+							ext.id,
+							ext.installed,
+							e instanceof Error ? e.message : String(e),
+						),
+					}));
+				});
+		}
+	}, [t]);
 
 	const refresh = useCallback(async () => {
 		try {
 			setLoading(true);
 			setError("");
-			const exts = await getExtensions();
-			setExtensions(exts);
+			// The pi.dev directory may fail independently (offline, CORS in
+			// browser mode) — don't let it take down the installed list.
+			const [exts, dir] = await Promise.allSettled([getExtensions(), fetchPiPackages()]);
+			if (exts.status === "fulfilled") {
+				setExtensions(exts.value);
+				setLoading(false);
+				void refreshPermissions(exts.value);
+			} else {
+				setError(exts.reason instanceof Error ? exts.reason.message : String(exts.reason));
+				setLoading(false);
+			}
+			if (dir.status === "fulfilled") setDirPackages(dir.value);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
-		} finally {
 			setLoading(false);
 		}
-	}, []);
+	}, [refreshPermissions]);
 
 	useEffect(() => {
 		refresh();
@@ -435,13 +811,17 @@ function ExtensionsTab() {
 			const requiresReload = await setExtensionEnabled(id, enabled);
 			setReloadHint(requiresReload);
 			// Optimistically flip the local state; a full refresh re-syncs with the agent.
-			setExtensions((prev) => prev.map((e) => (e.id === id ? { ...e, enabled } : e)));
+			// A package toggle (id is the package source) flips every extension it provides.
+			setExtensions((prev) =>
+				prev.map((e) => (e.id === id || e.packageSource === id ? { ...e, enabled } : e)),
+			);
 		},
 		[],
 	);
 
 	const [busyId, setBusyId] = useState<string | null>(null);
-	const [installMessage, setInstallMessage] = useState<string | null>(null);
+	/** Action feedback banner — errors render in danger color so failures aren't missed. */
+	const [installMessage, setInstallMessage] = useState<{ text: string; error: boolean } | null>(null);
 	// Synchronous guard so rapid double-clicks can't bypass the busyId state update.
 	const lifecycleLock = useRef<string | null>(null);
 
@@ -453,7 +833,7 @@ function ExtensionsTab() {
 			setInstallMessage(null);
 			try {
 				const result = await fn(id);
-				setInstallMessage(result.message);
+				setInstallMessage({ text: result.message, error: !result.ok });
 				if (result.ok) {
 					// Re-sync with the agent: install/uninstall may change tool/command counts,
 					// enabled state, or other fields beyond just `installed`.
@@ -463,7 +843,7 @@ function ExtensionsTab() {
 					setExtensions((prev) => prev.map((e) => (e.id === id ? { ...e, installed: result.installed } : e)));
 				}
 			} catch (e) {
-				setInstallMessage(e instanceof Error ? e.message : String(e));
+				setInstallMessage({ text: e instanceof Error ? e.message : String(e), error: true });
 			} finally {
 				lifecycleLock.current = null;
 				setBusyId(null);
@@ -474,6 +854,152 @@ function ExtensionsTab() {
 
 	const handleInstall = useCallback((id: string) => runLifecycle(id, installExtension), [runLifecycle]);
 	const handleUninstall = useCallback((id: string) => runLifecycle(id, uninstallExtension), [runLifecycle]);
+
+	const handleRemovePackage = useCallback(
+		async (source: string) => {
+			const ok = await confirmDialog({
+				title: t("plugins.extensions.uninstall"),
+				message: t("plugins.extensions.removePackageConfirm", { name: source }),
+				confirmLabel: t("common.remove"),
+				danger: true,
+			});
+			if (!ok) return;
+			setBusyId(source);
+			setInstallMessage(null);
+			try {
+				const result = await removePackage(source);
+				if (result.removed) {
+					setReloadHint(result.requiresReload);
+					setExtensions((prev) => prev.filter((e) => e.id !== source && e.packageSource !== source));
+				} else {
+					setInstallMessage({
+						text: result.error ?? t("plugins.extensions.removePackageFailed"),
+						error: true,
+					});
+				}
+			} catch (e) {
+				setInstallMessage({ text: e instanceof Error ? e.message : String(e), error: true });
+			} finally {
+				setBusyId(null);
+			}
+		},
+		[t],
+	);
+
+	const handleInstallPackage = useCallback(
+		async (pkg: PiPackage) => {
+			setInstallingName(pkg.name);
+			setInstallMessage(null);
+			const markInstalled = (requiresReload = true) => {
+				setInstalledNames((prev) => new Set(prev).add(pkg.name));
+				setReloadHint(requiresReload);
+				setInstallMessage({
+					text: t("plugins.extensions.directory.installedMsg", { name: pkg.name }),
+					error: false,
+				});
+			};
+			/** The install may complete server-side while its response frame is lost
+			 *  (channel reconnect mid-install). Re-check before reporting failure. */
+			const confirmInstalled = async (): Promise<boolean> => {
+				try {
+					const exts = await getExtensions();
+					setExtensions(exts);
+					return exts.some(
+						(e) => packageSourceNpmName(e.packageSource ?? e.id) === pkg.name,
+					);
+				} catch {
+					return false;
+				}
+			};
+			try {
+				const result = await installPluginPackage(`npm:${pkg.name}`);
+				if (result.installed) {
+					markInstalled(result.requiresReload);
+				} else if (await confirmInstalled()) {
+					markInstalled();
+				} else {
+					setInstallMessage({
+						text: result.error ?? t("plugins.extensions.directory.installFailed"),
+						error: true,
+					});
+				}
+			} catch (e) {
+				if (await confirmInstalled()) {
+					markInstalled();
+				} else {
+					setInstallMessage({ text: e instanceof Error ? e.message : String(e), error: true });
+				}
+			} finally {
+				setInstallingName(null);
+			}
+		},
+		[t],
+	);
+
+	const handleOpenPermission = useCallback(async (id: string, kind: ExtensionPermissionKind) => {
+		if (permissionBusy) return;
+		setPermissionBusy(`${id}:${kind}`);
+		const busyTimeout = window.setTimeout(() => setPermissionBusy(null), PERMISSION_OPEN_BUSY_MS);
+		try {
+			const result = await openExtensionPermissionSettings(id, kind);
+			if (!result.ok && result.message) setInstallMessage({ text: result.message, error: true });
+		} catch (e) {
+			setInstallMessage({ text: e instanceof Error ? e.message : String(e), error: true });
+		} finally {
+			window.clearTimeout(busyTimeout);
+			setPermissionBusy(null);
+		}
+	}, [permissionBusy]);
+
+	const handleRecheckPermissions = useCallback(async (id: string) => {
+		if (permissionBusy) return;
+		setPermissionBusy(`${id}:recheck`);
+		const requestId = ++permissionRequestSeq.current;
+		let settled = false;
+		const ext = extensions.find((item) => item.id === id);
+		setExtensionPermissions((prev) => {
+			const next = { ...prev };
+			delete next[id];
+			return next;
+		});
+		const timeout = window.setTimeout(() => {
+			if (settled || permissionRequestSeq.current !== requestId) return;
+			setExtensionPermissions((prev) => ({
+				...prev,
+				[id]: permissionFallbackState(
+					id,
+					ext?.installed ?? true,
+					t("plugins.extensions.permissions.checkSlow"),
+				),
+			}));
+			setPermissionBusy(null);
+		}, PERMISSION_CHECK_SLOW_MS);
+		try {
+			const result = await recheckExtensionPermissions(id);
+			settled = true;
+			window.clearTimeout(timeout);
+			if (permissionRequestSeq.current !== requestId) return;
+			setExtensionPermissions((prev) => ({ ...prev, [id]: result }));
+			setInstallMessage(result.ready
+				? { text: t("plugins.extensions.permissions.ready"), error: false }
+				: { text: t("plugins.extensions.permissions.stillMissing"), error: true });
+		} catch (e) {
+			settled = true;
+			window.clearTimeout(timeout);
+			if (permissionRequestSeq.current !== requestId) return;
+			setInstallMessage({ text: e instanceof Error ? e.message : String(e), error: true });
+			setExtensionPermissions((prev) => ({
+				...prev,
+				[id]: permissionFallbackState(
+					id,
+					ext?.installed ?? true,
+					e instanceof Error ? e.message : String(e),
+				),
+			}));
+		} finally {
+			if (permissionRequestSeq.current === requestId) setPermissionBusy(null);
+		}
+	}, [extensions, permissionBusy, t]);
 
 	if (loading) {
 		return (
@@ -491,9 +1017,51 @@ function ExtensionsTab() {
 		);
 	}
 
+	const query = search.trim().toLowerCase();
+	const filteredExtensions = query
+		? extensions.filter(
+				(e) =>
+					e.name.toLowerCase().includes(query) ||
+					e.description?.toLowerCase().includes(query) ||
+					e.packageSource?.toLowerCase().includes(query),
+			)
+		: extensions;
+	const filteredDir = query
+		? dirPackages.filter(
+				(p) =>
+					p.name.toLowerCase().includes(query) ||
+					p.description?.toLowerCase().includes(query) ||
+					p.author?.toLowerCase().includes(query),
+			)
+		: dirPackages;
+	// Names of npm packages already installed via the package manager.
+	const installedPkgNames = new Set(
+		extensions
+			.filter((e) => e.kind === "package")
+			.map((e) => packageSourceNpmName(e.packageSource ?? e.id))
+			.filter((n): n is string => n !== null),
+	);
+	// Installed npm packages whose extensions failed to load this session.
+	const loadFailedNames = new Set(
+		extensions
+			.filter((e) => e.kind === "package" && e.loadError)
+			.map((e) => packageSourceNpmName(e.packageSource ?? e.id))
+			.filter((n): n is string => n !== null),
+	);
+
 	return (
 		<div className="space-y-4">
-			<div className="flex items-center justify-end">
+			<div className="flex items-center gap-2">
+				<div className="relative flex-1">
+					<Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted" />
+					<input
+						type="text"
+						value={search}
+						onChange={(e) => setSearch(e.target.value)}
+						placeholder={t("plugins.extensions.search")}
+						className="w-full rounded-md border border-border bg-surface px-9 py-2 font-mono text-xs text-fg placeholder:text-muted focus:border-accent focus:outline-none"
+					/>
+				</div>
 				<Button size="sm" tone="neutral" onClick={refresh}>
 					{t("plugins.refresh")}
 				</Button>
@@ -506,27 +1074,71 @@ function ExtensionsTab() {
 			)}
 			{installMessage && (
 				<Card>
-					<p className="text-xs text-muted">{installMessage}</p>
+					<p className={cn("text-xs", installMessage.error ? "text-danger" : "text-muted")}>
+						{installMessage.text}
+					</p>
 				</Card>
 			)}
 
-			{extensions.length === 0 ? (
+			{filteredExtensions.length > 0 && (
+				<>
+					<h2 className="mb-3 text-sm font-semibold text-fg">
+						{t("plugins.extensions.installedSection")} ({filteredExtensions.length})
+					</h2>
+					<div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
+						{filteredExtensions.map((ext) => (
+							<ExtensionCard
+								key={ext.id}
+								ext={ext}
+								onToggle={handleToggle}
+								onInstall={handleInstall}
+								onUninstall={handleUninstall}
+								permissionState={extensionPermissions[ext.id]}
+								permissionBusy={permissionBusy}
+								onOpenPermission={handleOpenPermission}
+								onRecheckPermissions={handleRecheckPermissions}
+								onRemovePackage={handleRemovePackage}
+								busyId={busyId}
+							/>
+						))}
+					</div>
+				</>
+			)}
+			{filteredExtensions.length === 0 && extensions.length === 0 && (
 				<Card>
 					<div className="py-6 text-center">
 						<Puzzle className="mx-auto mb-2 h-8 w-8 text-muted/40" />
 						<p className="font-mono text-xs text-muted">{t("plugins.extensions.empty")}</p>
 					</div>
 				</Card>
+			)}
+
+			<div className="mb-3">
+				<h2 className="text-sm font-semibold text-fg">
+					{t("plugins.extensions.directory.section")} ({filteredDir.length})
+				</h2>
+				<p className="mt-1 text-[11px] leading-relaxed text-muted">
+					{t("plugins.extensions.directory.compatNote")}
+				</p>
+			</div>
+
+			{filteredDir.length === 0 ? (
+				<Card>
+					<div className="py-6 text-center">
+						<Puzzle className="mx-auto mb-2 h-8 w-8 text-muted/40" />
+						<p className="font-mono text-xs text-muted">{t("plugins.extensions.directory.empty")}</p>
+					</div>
+				</Card>
 			) : (
 				<div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-					{extensions.map((ext) => (
-						<ExtensionCard
-							key={ext.id}
-							ext={ext}
-							onToggle={handleToggle}
-							onInstall={handleInstall}
-							onUninstall={handleUninstall}
-							busyId={busyId}
+					{filteredDir.map((pkg) => (
+						<PiPackageCard
+							key={pkg.name}
+							pkg={pkg}
+							installed={installedPkgNames.has(pkg.name) || installedNames.has(pkg.name)}
+							failed={loadFailedNames.has(pkg.name)}
+							installing={installingName === pkg.name}
+							onInstall={() => void handleInstallPackage(pkg)}
 						/>
 					))}
 				</div>
@@ -570,7 +1182,9 @@ function ChannelCard({
 	const statusTone =
 		channel.status === "connected" ? "success" : channel.status === "error" ? "danger" : "neutral";
 	const statusKey = channel.enabled ? channel.status : "disconnected";
-	const wsName = channel.workspace ? channel.workspace.replace(/\/+$/, "").split("/").pop() ?? channel.workspace : "";
+	// A channel delivering to the persistent main assistant shows the same name
+	// the sidebar uses for it — not the raw directory basename.
+	const wsName = channel.workspace ? (isMainChatCwd(channel.workspace) ? t("layout.agent") : pathBasename(channel.workspace)) : "";
 	return (
 		<Card className="@container transition-colors hover:border-accent/40">
 			<div className="flex flex-col gap-3 @sm:flex-row @sm:items-start @sm:justify-between">
@@ -580,11 +1194,6 @@ function ChannelCard({
 						<span className="truncate text-sm font-medium text-fg">{channel.name}</span>
 						<code className="font-mono text-[10px] text-muted">{t(`channels.types.${channel.type}`)}</code>
 					</div>
-					{(channel.server || channel.channel) && (
-						<p className="mt-1.5 truncate font-mono text-xs text-muted">
-							{[channel.server, channel.channel].filter(Boolean).join(" / ")}
-						</p>
-					)}
 					<div className="mt-3 flex flex-wrap items-center gap-2">
 						<Badge tone={statusTone}>{t(`channels.status.${statusKey}`)}</Badge>
 						{wsName ? (
@@ -776,81 +1385,37 @@ function ChannelsTab() {
 	);
 }
 
-export default function PluginsView() {
+// Plugins page content — rendered inside the Settings shell (left nav +
+// page title) at /settings?page=plugins. Own chrome lives in SettingsView.
+export function PluginsContent() {
 	const { t } = useTranslation();
-	const navigate = useNavigate();
-	const location = useLocation();
-	const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>() ?? { sidebarCollapsed: false };
 	const [tab, setTab] = useState<PluginTab>("skills");
 
-	const histIdx = (window.history.state as { idx?: number } | null)?.idx ?? 0;
-	const canBack = histIdx > 0;
-	const canForward = histIdx > 0 && location.key !== "";
-
 	return (
-		<div className="flex h-full flex-col">
-			<div
-				data-tauri-drag-region
-				className={cn(
-					"flex h-11 shrink-0 items-center gap-1 border-b border-border bg-surface/80 pr-6 backdrop-blur transition-[padding] duration-150",
-					sidebarCollapsed ? "pl-[120px]" : "pl-6",
-				)}
-			>
-				<button
-					data-no-drag
-					type="button"
-					onClick={() => navigate(-1)}
-					disabled={!canBack}
-					className={cn(
-						"flex h-8 w-8 items-center justify-center rounded-lg transition-colors",
-						canBack ? "text-muted hover:bg-surface-2 hover:text-fg" : "text-muted/30",
-					)}
-					title={t("common.back")}
-				>
-					<ArrowLeft className="h-4 w-4" />
-				</button>
-				<button
-					data-no-drag
-					type="button"
-					onClick={() => navigate(1)}
-					disabled={!canForward}
-					className={cn(
-						"flex h-8 w-8 items-center justify-center rounded-lg transition-colors",
-						canForward ? "text-muted hover:bg-surface-2 hover:text-fg" : "text-muted/30",
-					)}
-					title={t("common.forward")}
-				>
-					<ArrowRight className="h-4 w-4" />
-				</button>
+		<>
+			<p className="-mt-2 mb-6 text-sm text-muted">{t("plugins.description")}</p>
+
+			<div className="mb-6 flex gap-1 border-b border-border">
+				{TABS.map(({ key, icon: Icon }) => (
+					<button
+						key={key}
+						onClick={() => setTab(key)}
+						className={cn(
+							"flex items-center gap-1.5 px-4 py-2 text-sm font-medium transition-colors",
+							tab === key
+								? "border-b-2 border-accent text-accent"
+								: "text-muted hover:text-fg",
+						)}
+					>
+						<Icon className="h-3.5 w-3.5" />
+						{t(`plugins.tabs.${key}`)}
+					</button>
+				))}
 			</div>
 
-			<div className="scrollbar-hide flex-1 overflow-y-auto">
-				<div className="mx-auto max-w-5xl px-10 pb-10 pt-10">
-					<PageHeader title={t("plugins.title")} description={t("plugins.description")} />
-
-					<div className="mb-6 flex gap-1 border-b border-border">
-						{TABS.map(({ key, icon: Icon }) => (
-							<button
-								key={key}
-								onClick={() => setTab(key)}
-								className={cn(
-									"flex items-center gap-1.5 px-4 py-2 text-sm font-medium transition-colors",
-									tab === key
-										? "border-b-2 border-accent text-accent"
-										: "text-muted hover:text-fg",
-								)}
-							>
-								<Icon className="h-3.5 w-3.5" />
-								{t(`plugins.tabs.${key}`)}
-							</button>
-						))}
-					</div>
-
-					{tab === "skills" && <SkillsTab />}
-					{tab === "extensions" && <ExtensionsTab />}
-					{tab === "channels" && <ChannelsTab />}
-				</div>
-			</div>
-		</div>
+			{tab === "skills" && <SkillsTab />}
+			{tab === "extensions" && <ExtensionsTab />}
+			{tab === "channels" && <ChannelsTab />}
+		</>
 	);
 }

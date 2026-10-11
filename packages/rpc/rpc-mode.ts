@@ -12,6 +12,8 @@
  */
 
 import * as crypto from "node:crypto";
+import { readFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { AgentMessage } from "../../src/core/agent/types.js";
 import { computeMessageStats, type SessionStats } from "../../src/core/session-stats.js";
 import type {
@@ -30,12 +32,14 @@ import {
 	getBuiltinExtensionInfo,
 	getBuiltinExtensionInfos,
 	getBuiltinExtensionLifecycle,
+	getBuiltinInstallState,
 } from "../../src/builtin-extensions/index.js";
 import { exportFromFile } from "../../src/core/export-html/index.js";
+import { installSkillFromGitHub } from "../../src/core/skill-install.js";
 import { buildHistoryTreeNodes } from "../../src/core/projection/history-tree.js";
 import { killTrackedDetachedChildren } from "../../src/utils/shell.js";
 import { startPtyServer, type PtyServer } from "../pty/pty-server.js";
-import { type Theme, theme } from "../../packages/tui/theme/theme.js";
+import { type Theme, theme, resolveThemeIcon, resolveThemeVideo } from "../../packages/tui/theme/theme.js";
 import { SchedulerEngine, type Dispatcher as SchedulerDispatcher } from "../../src/core/scheduler/index.js";
 import { SCHEDULED_TASK_FIRED, SCHEDULED_TASK_COMPLETED, type ScheduledTaskPatch, type SessionTarget } from "@tomsun28/pizza-protocol";
 import { installCrashHandlers } from "../../src/core/crash-handlers.js";
@@ -49,7 +53,9 @@ import type {
 	RpcSlashCommand,
 	RpcExtensionInfo,
 	RpcSkillInfo,
+	RpcThemeInfo,
 } from "./rpc-types.js";
+import { getThemesDir } from "../../src/config.js";
 import type { ImageContent } from "@earendil-works/pi-ai/compat";
 
 // Re-export types for consumers
@@ -190,9 +196,8 @@ function extensionIdFromPath(extPath: string): string {
  */
 function canonicalWorkspaceId(cwd: string): string {
 	if (/^ws_[0-9a-f]{12}$/.test(cwd)) return cwd;
-	const { resolve } = require("node:path") as typeof import("node:path");
 	const canonical = resolve(cwd).replace(/\\/g, "/");
-	return `ws_${require("node:crypto").createHash("sha256").update(canonical).digest("hex").slice(0, 12)}`;
+	return `ws_${crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 12)}`;
 }
 
 function workspaceIdMatches(provided: string | undefined, expected: string | undefined): boolean {
@@ -270,21 +275,33 @@ async function refreshSkillsFromDisk(facade: SessionFacade): Promise<void> {
 async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionInfo[]> {
 	const infos: RpcExtensionInfo[] = [];
 	const loadedIds = new Set<string>();
-	const loaded = facade.resourceLoader?.getExtensions().extensions ?? [];
+	const extensionsResult = facade.resourceLoader?.getExtensions();
+	const loaded = extensionsResult?.extensions ?? [];
 	const cwd = facade.runtime?.cwd ?? process.cwd();
 
-	// Resolve install state (installed?) for every installable built-in up front,
-	// concurrently. Best-effort: a failed check defaults to "not installed".
+	// Map extension load errors back to the package that produced them (error
+	// paths live under the package's installed dir) so the UI can flag a
+	// package that partially or fully failed to load — e.g. a pi-marketplace
+	// package importing APIs pizza doesn't provide.
+	const packages = facade.resourceLoader?.listConfiguredPackages?.() ?? [];
+	const packageLoadErrors = new Map<string, string>();
+	for (const pkg of packages) {
+		if (!pkg.installedPath) continue;
+		for (const err of extensionsResult?.errors ?? []) {
+			const rel = relative(pkg.installedPath, err.path);
+			if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+				const prev = packageLoadErrors.get(pkg.source);
+				packageLoadErrors.set(pkg.source, prev ? `${prev}\n${err.error}` : err.error);
+			}
+		}
+	}
+
+	// Installed state of every built-in, read from extensions.json — no probing.
+	const registry = facade.settingsManager.extensions;
 	const installState = new Map<string, { installed: boolean; version?: string }>();
 	await Promise.all(
 		getBuiltinExtensionInfos().map(async (info) => {
-			const lc = getBuiltinExtensionLifecycle(info.id);
-			if (!lc?.installable || !lc.checkInstalled) return;
-			try {
-				installState.set(info.id, await lc.checkInstalled(cwd));
-			} catch {
-				installState.set(info.id, { installed: false });
-			}
+			installState.set(info.id, await getBuiltinInstallState(registry, info.id, cwd));
 		}),
 	);
 
@@ -295,24 +312,29 @@ async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionI
 		loadedIds.add(id);
 		const builtin = getBuiltinExtensionInfo(id);
 		const installable = installableFor(id);
+		const kind = extensionKind(ext);
+		// Package extensions toggle as a whole package (by its source).
+		const packageSource = kind === "package" ? ext.sourceInfo.source : undefined;
 		infos.push({
 			id,
 			name: builtin?.name ?? id,
 			description: builtin?.description,
-			kind: extensionKind(ext),
+			kind,
 			enabled: true,
-			canToggle: Boolean(builtin),
+			canToggle: Boolean(builtin) || packageSource !== undefined,
+			packageSource,
 			installable,
 			installed: installable ? (installState.get(id)?.installed ?? false) : true,
 			path: ext.path,
 			toolCount: ext.tools.size,
 			commandCount: ext.commands.size,
 			builtinCommandCount: ext.builtinCommands?.size ?? 0,
+			loadError: packageSource ? packageLoadErrors.get(packageSource) : undefined,
 		});
 	}
 
 	// Built-ins that are not currently loaded. A built-in shows as disabled only
-	// when the user has explicitly disabled it (settings.disabledBuiltinExtensions);
+	// when the user has explicitly disabled it (extensions.json);
 	// otherwise it is considered enabled even if this facade has no resource loader
 	// (e.g. minimal/embedded sessions).
 	const disabledBuiltins = facade.settingsManager.getDisabledBuiltinExtensions();
@@ -334,6 +356,34 @@ async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionI
 			builtinCommandCount: 0,
 		});
 	}
+
+	// Installed packages without a loaded extension: disabled ones, and packs
+	// that contribute only themes/skills/prompts. They still get a row so users
+	// can see, re-enable and remove them.
+	const loadedPackageSources = new Set(
+		loaded.filter((e) => e.sourceInfo?.origin === "package").map((e) => e.sourceInfo.source),
+	);
+	for (const pkg of packages) {
+		if (loadedPackageSources.has(pkg.source)) continue;
+		const manifest = readInstalledPackageJson(pkg.installedPath);
+		infos.push({
+			id: pkg.source,
+			name: manifest?.name ?? pkg.source,
+			description: manifest?.description,
+			kind: "package",
+			enabled: pkg.enabled,
+			canToggle: true,
+			packageSource: pkg.source,
+			installable: false,
+			installed: true,
+			path: pkg.installedPath ?? pkg.source,
+			toolCount: 0,
+			commandCount: 0,
+			builtinCommandCount: 0,
+			loadError: packageLoadErrors.get(pkg.source),
+		});
+	}
+
 	// Stable ordering: built-ins first, then the rest by id.
 	infos.sort((a, b) => {
 		if ((a.kind === "builtin") !== (b.kind === "builtin")) {
@@ -341,6 +391,45 @@ async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionI
 		}
 		return a.id.localeCompare(b.id);
 	});
+	return infos;
+}
+
+/** Read name/description from an installed package's package.json (best-effort). */
+function readInstalledPackageJson(installedPath: string | undefined): { name?: string; description?: string } | undefined {
+	if (!installedPath) return undefined;
+	try {
+		const pkg = JSON.parse(readFileSync(join(installedPath, "package.json"), "utf-8"));
+		return { name: pkg.name, description: pkg.description };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Build the theme list for the `get_themes` RPC: every theme the resource
+ * loader resolved (user themes dir, project dirs, extension-contributed
+ * themePaths), restricted to themes that expose web/desktop tokens.
+ */
+function buildThemeInfos(facade: SessionFacade): RpcThemeInfo[] {
+	const builtinDir = getThemesDir();
+	const themes = facade.resourceLoader?.getThemes().themes ?? [];
+	const infos: RpcThemeInfo[] = [];
+	for (const theme of themes) {
+		if (!theme.name || !theme.web) continue;
+		infos.push({
+			name: theme.name,
+			label: theme.web.label ?? theme.name,
+			path: theme.sourcePath,
+			source: theme.sourceInfo?.source,
+			builtin: !theme.sourcePath || theme.sourcePath.startsWith(builtinDir),
+			web: {
+				...theme.web,
+				icon: resolveThemeIcon(theme.web.icon, theme.sourcePath),
+				video: resolveThemeVideo(theme.web.video, theme.sourcePath),
+			},
+		});
+	}
+	infos.sort((a, b) => a.name.localeCompare(b.name));
 	return infos;
 }
 
@@ -384,17 +473,13 @@ async function runExtensionLifecycle(
 	if (!fn) {
 		return { ok: false, message: `No ${action} handler for ${extensionId}.`, installed: false };
 	}
+	const registry = facade.settingsManager.extensions;
 	const task = (async () => {
 		try {
+			// The install/uninstall handlers record their outcome in extensions.json
+			// themselves; a failed action leaves whatever was recorded before.
 			const result = await fn(cwd);
-			let installed = action === "install" ? result.ok : false;
-			if (lc.checkInstalled) {
-				try {
-					installed = (await lc.checkInstalled(cwd)).installed;
-				} catch {
-					installed = action === "install" ? result.ok : false;
-				}
-			}
+			const { installed } = await getBuiltinInstallState(registry, extensionId, cwd);
 			return { ok: result.ok, message: result.message, installed };
 		} finally {
 			lifecycleInFlight.delete(extensionId);
@@ -402,6 +487,44 @@ async function runExtensionLifecycle(
 	})();
 	lifecycleInFlight.set(extensionId, task);
 	return task;
+}
+
+async function getExtensionPermissions(
+	facade: SessionFacade,
+	extensionId: string,
+	recheck = false,
+) {
+	const lc = getBuiltinExtensionLifecycle(extensionId);
+	const fn = recheck ? lc?.recheckPermissions : lc?.checkPermissions;
+	if (!fn) {
+		return {
+			extensionId,
+			supported: false,
+			installed: false,
+			ready: false,
+			message: "This extension does not expose OS permission status.",
+			permissions: [],
+		};
+	}
+	const cwd = facade.runtime?.cwd ?? process.cwd();
+	const result = await fn(cwd);
+	return { extensionId, ...result };
+}
+
+async function openExtensionPermissionSettings(
+	facade: SessionFacade,
+	extensionId: string,
+	permissionKind: "accessibility" | "screenRecording",
+) {
+	const lc = getBuiltinExtensionLifecycle(extensionId);
+	if (!lc?.openPermissionSettings) {
+		return {
+			ok: false,
+			message: "This extension does not support opening OS permission settings.",
+		};
+	}
+	const cwd = facade.runtime?.cwd ?? process.cwd();
+	return lc.openPermissionSettings(cwd, permissionKind);
 }
 
 
@@ -671,7 +794,7 @@ export async function runRpcModeWithFacade(
 		dispatcher: schedulerDispatcher,
 		listener: (event) => {
 			// Forward scheduler lifecycle events over the rpc_event stream so
-			// the UI can render the "⏰ 已触发" notice + history in real time.
+			// the UI can render the "⏰ task fired" notice + history in real time.
 			if (event.type === "task.fired") {
 				const p = event.payload as { taskId: string; at: number; sessionId?: string };
 				writeRawStdout(serializeJsonLine({
@@ -723,6 +846,14 @@ export async function runRpcModeWithFacade(
 					clearTimeout(timer);
 					unsub();
 					resolve(event.payload as { summary: string; first_kept_event_id: string; tokens_before: number });
+				} else if (event.type === "COMPACTION_ABORTED") {
+					// A failed/aborted compaction emits ABORTED, not END — surface
+					// the real reason ("Nothing to compact", user cancelled, ...)
+					// instead of hanging until the timeout.
+					clearTimeout(timer);
+					unsub();
+					const payload = event.payload as { message?: string; reason?: string };
+					reject(new Error(payload.message ?? payload.reason ?? "Compaction aborted"));
 				}
 			});
 			facade.compact({ reason: "manual" });
@@ -858,18 +989,23 @@ export async function runRpcModeWithFacade(
 			case "get_available_models": {
 				// Return ALL models, annotated with hasAuth so the UI can show
 				// unconfigured models as disabled rather than hiding them.
+				// With authOnly, only configured models are sent (the UI hides the
+				// rest anyway); `total` still lets it tell "no API key configured"
+				// apart from "no models at all".
 				const registry = facade.modelRegistry;
 				const all = registry?.getAll() ?? [];
-				const models = all.map((m) => ({
-					id: m.id,
-					name: m.name,
-					api: m.api,
-					provider: m.provider,
-					reasoning: (m as { reasoning?: boolean }).reasoning,
-					contextWindow: (m as { contextWindow?: number }).contextWindow,
-					hasAuth: registry ? registry.hasConfiguredAuth(m) : true,
-				}));
-				return success(id, "get_available_models", { models });
+				const models = all
+					.map((m) => ({
+						id: m.id,
+						name: m.name,
+						api: m.api,
+						provider: m.provider,
+						reasoning: (m as { reasoning?: boolean }).reasoning,
+						contextWindow: (m as { contextWindow?: number }).contextWindow,
+						hasAuth: registry ? registry.hasConfiguredAuth(m) : true,
+					}))
+					.filter((m) => !command.authOnly || m.hasAuth);
+				return success(id, "get_available_models", { models, total: all.length });
 			}
 
 			case "cycle_model": {
@@ -986,6 +1122,8 @@ export async function runRpcModeWithFacade(
 				return success(id, "set_auto_compaction");
 
 			case "get_commands": {
+				// Same pool the TUI's `/` autocomplete draws from: extension
+				// commands, prompt templates and (when enabled) skill commands.
 				const commands: RpcSlashCommand[] =
 					facade.extensionRunner?.getRegisteredCommands().map((command) => ({
 						name: command.invocationName,
@@ -993,6 +1131,25 @@ export async function runRpcModeWithFacade(
 						source: "extension" as const,
 						sourceInfo: command.sourceInfo,
 					})) ?? [];
+				for (const prompt of facade.resourceLoader?.getPrompts().prompts ?? []) {
+					commands.push({
+						name: prompt.name,
+						description: prompt.description,
+						source: "prompt",
+						...(prompt.argumentHint && { argumentHint: prompt.argumentHint }),
+						sourceInfo: prompt.sourceInfo,
+					});
+				}
+				if (facade.settingsManager.getEnableSkillCommands()) {
+					for (const skill of facade.resourceLoader?.getSkills().skills ?? []) {
+						commands.push({
+							name: `skill:${skill.name}`,
+							description: skill.description,
+							source: "skill",
+							sourceInfo: skill.sourceInfo,
+						});
+					}
+				}
 				return success(id, "get_commands", { commands });
 			}
 
@@ -1179,6 +1336,14 @@ export async function runRpcModeWithFacade(
 				facade.settingsManager.setSchedulerPolicy(policy);
 				return success(id, "set_scheduler_policy", { policy: facade.settingsManager.getSchedulerPolicy() });
 			}
+			case "get_network": {
+				return success(id, "get_network", { network: facade.settingsManager.getNetworkSettings() });
+			}
+			case "set_network": {
+				const network = (command as unknown as { network: import("@tomsun28/pizza-protocol").NetworkSettings }).network;
+				facade.settingsManager.setNetworkSettings(network ?? {});
+				return success(id, "set_network", { network: facade.settingsManager.getNetworkSettings() });
+			}
 		case "new_session": {
 			// Long-lived agents cache skills from process start; pick up skills
 			// added/removed on disk so each new conversation sees the current set.
@@ -1237,23 +1402,50 @@ export async function runRpcModeWithFacade(
 			return success(id, "delete_skill", { name: command.skillName });
 		}
 
+		case "install_skill": {
+			// Marketplace install: fetch the skill's directory from its GitHub
+			// repo into ~/.agents/skills (the shared user skills dir), then
+			// re-scan so this session and the skills panel see it without a restart.
+			const skillsDir = facade.resourceLoader?.getUserSkillsDir?.();
+			if (!skillsDir) {
+				return error(id, "install_skill", "This session cannot install skills.");
+			}
+			try {
+				const installed = await installSkillFromGitHub({
+					source: command.source,
+					slug: command.slug,
+					skillsDir,
+				});
+				await refreshSkillsFromDisk(facade);
+				return success(id, "install_skill", installed);
+			} catch (e) {
+				return error(id, "install_skill", e instanceof Error ? e.message : String(e));
+			}
+		}
+
 		case "get_extensions": {
 			const extensions = await buildExtensionInfos(facade);
 			return success(id, "get_extensions", { extensions });
 		}
 
+		case "get_themes": {
+			const themes = buildThemeInfos(facade);
+			return success(id, "get_themes", { themes });
+		}
+
 		case "set_extension_enabled": {
-			const info = getBuiltinExtensionInfo(command.extensionId);
-			if (!info) {
+			// extensionId is a built-in id or an installed package's source.
+			if (getBuiltinExtensionInfo(command.extensionId)) {
+				facade.settingsManager.setBuiltinExtensionDisabled(command.extensionId, !command.enabled);
+			} else if (!facade.resourceLoader?.setConfiguredPackageEnabled?.(command.extensionId, command.enabled)) {
 				return error(
 					id,
 					"set_extension_enabled",
-					"Only built-in extensions can be toggled. Manage other extensions via `pizza plugin`.",
+					`Not a built-in extension or installed plugin package: ${command.extensionId}`,
 				);
 			}
-			facade.settingsManager.setBuiltinExtensionDisabled(command.extensionId, !command.enabled);
-			// Disabling/enabling a built-in changes which extensions are loaded; that
-			// only takes full effect after the session reloads its resources.
+			// Toggling changes which extensions are loaded; that only takes full
+			// effect after the session reloads its resources.
 			return success(id, "set_extension_enabled", {
 				id: command.extensionId,
 				enabled: command.enabled,
@@ -1281,6 +1473,55 @@ export async function runRpcModeWithFacade(
 			});
 		}
 
+		case "install_package": {
+			if (!facade.resourceLoader?.installConfiguredPackage) {
+				return error(id, "install_package", "Package installation is not available in this mode");
+			}
+			await facade.resourceLoader.installConfiguredPackage(command.source);
+			// Resources the package contributes (extensions, skills, ...) only
+			// become active after the session reloads its resources.
+			return success(id, "install_package", { source: command.source, installed: true, requiresReload: true });
+		}
+
+		case "remove_package": {
+			const removed = await facade.resourceLoader?.removeConfiguredPackage?.(command.source);
+			if (!removed) {
+				return error(id, "remove_package", `Package not configured: ${command.source}`);
+			}
+			// Resources the package contributed (themes, skills, ...) stay loaded
+			// until the session reloads its resources.
+			return success(id, "remove_package", { source: command.source, removed: true, requiresReload: true });
+		}
+
+		case "get_extension_permissions": {
+			return success(
+				id,
+				"get_extension_permissions",
+				await getExtensionPermissions(facade, command.extensionId),
+			);
+		}
+
+		case "recheck_extension_permissions": {
+			return success(
+				id,
+				"recheck_extension_permissions",
+				await getExtensionPermissions(facade, command.extensionId, true),
+			);
+		}
+
+		case "open_extension_permission_settings": {
+			const result = await openExtensionPermissionSettings(
+				facade,
+				command.extensionId,
+				command.permissionKind,
+			);
+			return success(id, "open_extension_permission_settings", {
+				extensionId: command.extensionId,
+				ok: result.ok,
+				message: result.message,
+			});
+		}
+
 		case "reload_providers": {
 			// Credentials may be written to auth.json out-of-band (e.g. by the
 			// desktop Tauri bridge). Reload the in-memory cache so model auth
@@ -1292,17 +1533,28 @@ export async function runRpcModeWithFacade(
 				registry.authStorage.reload();
 				registry.refresh();
 			}
-			// If the facade is still using the placeholder model (provider="none",
-			// set at startup when no API key was configured), try to resolve a real
-			// model now that credentials have been reloaded. This is critical for
-			// gateway mode where restart_sidecar can't respawn the agent process —
-			// without this, get_state keeps returning model=undefined and the GUI
-			// bounces the user back to the setup page forever.
+			// If the facade's current model no longer resolves — either the
+			// placeholder (provider="none", set at startup when no API key was
+			// configured) or a model whose provider was removed/reconfigured in
+			// models.json while the agent kept running — try to resolve a real
+			// model now that credentials have been reloaded. This is critical
+			// for gateway mode where restart_sidecar can't respawn the agent
+			// process — without this, get_state keeps returning model=undefined
+			// and the GUI bounces the user back to the setup page forever.
 			const currentModel = facade.model;
-			if (currentModel.provider === "none" && registry) {
+			if (registry && !registry.find(currentModel.provider, currentModel.model_id)) {
 				const available = registry.getAvailable();
-				if (available.length > 0) {
-					facade.setModel(available[0]);
+				// Prefer the saved default when it still resolves and has auth;
+				// otherwise fall back to the first available model, mirroring
+				// findInitialModel's priority order.
+				const defaultProvider = facade.settingsManager.getDefaultProvider();
+				const defaultModelId = facade.settingsManager.getDefaultModel();
+				let next =
+					defaultProvider && defaultModelId ? registry.find(defaultProvider, defaultModelId) : undefined;
+				if (next && !registry.hasConfiguredAuth(next)) next = undefined;
+				if (!next && available.length > 0) next = available[0];
+				if (next) {
+					facade.setModel(next);
 					// The runtime's llmClient was left as null at startup (no model
 					// → no client). Build and inject one now so the reactor can
 					// actually call the provider on the first prompt — without this

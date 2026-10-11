@@ -3,14 +3,16 @@
  *
  * Built-in extensions ship with Pizza and are enabled by default. They behave
  * exactly like user extensions (loaded via the same `ExtensionFactory` path)
- * but are always present unless the user explicitly disables one in
- * `settings.json` under `disabledBuiltinExtensions`.
+ * but are always present unless the user explicitly disables one. Enabled and
+ * installed state live in `~/.pizza/agent/extensions.json` (ExtensionRegistry),
+ * shared with installed plugin packages.
  *
  * To add a new built-in extension:
  * 1. Create a folder under `src/builtin-extensions/<id>/` exporting an `ExtensionFactory`.
  * 2. Register it in `BUILTIN_EXTENSIONS` below with a stable id.
  */
 
+import { BUILTIN_EXTENSION_SOURCE, type ExtensionRegistry } from "../core/extension-registry.js";
 import type { ExtensionFactory } from "../core/extensions/types.js";
 import {
 	AGENT_BROWSER_EXTENSION_ID,
@@ -23,6 +25,9 @@ import {
 	COMPUTER_USE_EXTENSION_ID,
 	checkComputerUseInstalled,
 	createComputerUseExtension,
+	getComputerUsePermissionStatus,
+	openComputerUsePermissionSettings,
+	recheckComputerUsePermissionStatus,
 	runComputerUseInstall,
 	runComputerUseUninstall,
 } from "./computer-use/index.js";
@@ -39,8 +44,27 @@ export interface ExtensionInstallState {
 	version?: string;
 }
 
+export type ExtensionPermissionKind = "accessibility" | "screenRecording";
+
+export interface ExtensionPermissionInfo {
+	kind: ExtensionPermissionKind;
+	label: string;
+	description: string;
+	granted: boolean;
+	required: boolean;
+}
+
+export interface ExtensionPermissionState {
+	supported: boolean;
+	installed: boolean;
+	ready: boolean;
+	helperPath?: string;
+	message?: string;
+	permissions: ExtensionPermissionInfo[];
+}
+
 export interface BuiltinExtension {
-	/** Stable id used in `settings.disabledBuiltinExtensions`. */
+	/** Stable id used as this extension's key in extensions.json. */
 	id: string;
 	/** Human-readable name shown in UI. Defaults to the id. */
 	name: string;
@@ -50,12 +74,22 @@ export interface BuiltinExtension {
 	factory: ExtensionFactory;
 	/** Whether this built-in ships an external dependency that can be installed/uninstalled (e.g. a CLI binary). */
 	installable?: boolean;
-	/** Check whether the external dependency is installed. Only when installable. */
+	/**
+	 * Legacy probe for whether the external dependency is installed. Only used
+	 * once, to seed extensions.json for installs made before the registry
+	 * existed — read state through {@link getBuiltinInstallState}.
+	 */
 	checkInstalled?: (cwd: string) => Promise<ExtensionInstallState>;
 	/** Install the external dependency. Only when installable. */
 	install?: (cwd: string) => Promise<ExtensionLifecycleResult>;
 	/** Uninstall the external dependency. Only when installable. */
 	uninstall?: (cwd: string) => Promise<ExtensionLifecycleResult>;
+	/** Check OS/application permissions needed by the extension's external dependency. */
+	checkPermissions?: (cwd: string) => Promise<ExtensionPermissionState>;
+	/** Recheck permissions after the user changes OS settings. */
+	recheckPermissions?: (cwd: string) => Promise<ExtensionPermissionState>;
+	/** Open the OS settings pane for a missing permission. */
+	openPermissionSettings?: (cwd: string, kind: ExtensionPermissionKind) => Promise<ExtensionLifecycleResult>;
 }
 
 /**
@@ -82,6 +116,9 @@ export const BUILTIN_EXTENSIONS: readonly BuiltinExtension[] = [
 		checkInstalled: (cwd) => checkComputerUseInstalled(cwd),
 		install: (cwd) => runComputerUseInstall(cwd),
 		uninstall: (cwd) => runComputerUseUninstall(cwd),
+		checkPermissions: (cwd) => getComputerUsePermissionStatus(cwd),
+		recheckPermissions: (cwd) => recheckComputerUsePermissionStatus(cwd),
+		openPermissionSettings: (cwd, kind) => openComputerUsePermissionSettings(cwd, kind),
 	},
 ];
 
@@ -117,10 +154,49 @@ export function getBuiltinExtensionInfo(id: string): BuiltinExtensionInfo | unde
 }
 
 
+/**
+ * Installed state of a built-in, read from extensions.json. Non-installable
+ * built-ins are always installed. A built-in with no recorded state yet
+ * (installed before the registry existed) is detected once with its legacy
+ * `checkInstalled` probe and the result recorded — after that, only Pizza's
+ * own install/uninstall actions change it.
+ */
+export async function getBuiltinInstallState(
+	registry: ExtensionRegistry,
+	id: string,
+	cwd: string,
+): Promise<ExtensionInstallState> {
+	const ext = BUILTIN_EXTENSIONS.find((e) => e.id === id);
+	if (!ext?.installable) return { installed: true };
+	const record = registry.get(id);
+	if (record?.installed !== undefined) return { installed: record.installed, version: record.version };
+	let state: ExtensionInstallState = { installed: false };
+	try {
+		state = (await ext.checkInstalled?.(cwd)) ?? state;
+	} catch {
+		// Probe failed: record "not installed"; installing through Pizza fixes it.
+	}
+	recordBuiltinInstallState(registry, id, state);
+	return state;
+}
+
+/** Record a built-in's install state (after Pizza installs/uninstalls it). */
+export function recordBuiltinInstallState(registry: ExtensionRegistry, id: string, state: ExtensionInstallState): void {
+	registry.patch(
+		id,
+		{
+			installed: state.installed,
+			version: state.installed ? state.version : undefined,
+			installedAt: state.installed ? new Date().toISOString() : undefined,
+		},
+		{ source: BUILTIN_EXTENSION_SOURCE, enabled: true },
+	);
+}
+
 /** Look up the install lifecycle (install/uninstall/checkInstalled) for a built-in id. */
 export function getBuiltinExtensionLifecycle(
 	id: string,
-): Pick<BuiltinExtension, "installable" | "checkInstalled" | "install" | "uninstall"> | undefined {
+): Pick<BuiltinExtension, "installable" | "checkInstalled" | "install" | "uninstall" | "checkPermissions" | "recheckPermissions" | "openPermissionSettings"> | undefined {
 	const ext = BUILTIN_EXTENSIONS.find((e) => e.id === id);
 	if (!ext) return undefined;
 	return {
@@ -128,5 +204,8 @@ export function getBuiltinExtensionLifecycle(
 		checkInstalled: ext.checkInstalled,
 		install: ext.install,
 		uninstall: ext.uninstall,
+		checkPermissions: ext.checkPermissions,
+		recheckPermissions: ext.recheckPermissions,
+		openPermissionSettings: ext.openPermissionSettings,
 	};
 }

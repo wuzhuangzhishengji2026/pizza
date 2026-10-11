@@ -32,13 +32,13 @@ function CodeBlock({
 	return (
 		<div className="group/code relative my-3 overflow-hidden rounded-lg border border-border bg-surface-2">
 			<div className="flex items-center justify-between border-b border-border/60 px-3 py-1.5">
-				<span className="font-mono text-[10px] uppercase tracking-widest text-muted">
+				<span className="text-[11px] font-medium text-muted">
 					{lang || t("markdown.code")}
 				</span>
 				<button
 					type="button"
 					onClick={copy}
-					className="flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] text-muted transition-colors hover:bg-surface hover:text-fg"
+					className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted transition-colors hover:bg-surface hover:text-fg"
 					title={t("markdown.copyCode")}
 				>
 					{copied ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
@@ -94,7 +94,7 @@ function MarkdownImpl({
 	// (CodeBlock, inline code, links) read `highlight`/`highlightActive` here.
 	const highlightComponents: Components = highlight ? makeHighlightComponents(highlight, !!highlightActive) : {};
 	return (
-		<div className={cn("md", className)}>
+		<div className={cn("md select-text", className)}>
 			<ReactMarkdown
 				remarkPlugins={[remarkGfm]}
 				components={{
@@ -125,7 +125,7 @@ function MarkdownImpl({
 							// (used when running as a plain web app).
 						};
 						return (
-							<a href={href} target="_blank" rel="noreferrer" onClick={openExternal} className="text-accent underline underline-offset-2 hover:opacity-80">
+							<a href={href} target="_blank" rel="noreferrer" onClick={openExternal} className="text-link underline underline-offset-2 hover:opacity-80">
 								{highlight ? highlightNodes(c as ReactNode, highlight, !!highlightActive) : (c as ReactNode)}
 							</a>
 						);

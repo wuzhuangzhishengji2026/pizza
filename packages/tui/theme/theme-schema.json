@@ -313,6 +313,45 @@
 				}
 			},
 			"additionalProperties": false
+		},
+		"web": {
+			"type": "object",
+			"description": "Optional web/desktop UI theme. Token keys map to CSS custom properties (--bg, --surface, --accent, --syn-*, --retro-*, ...); values may reference vars entries.",
+			"properties": {
+				"label": {
+					"type": "string",
+					"description": "Display name shown in the web UI theme picker"
+				},
+				"mode": {
+					"type": "string",
+					"enum": ["light", "dark"],
+					"description": "Which base palette the tokens extend (default: inferred from theme name)"
+				},
+				"tokens": {
+					"type": "object",
+					"description": "CSS custom-property overrides, keyed without the -- prefix",
+					"additionalProperties": {
+						"type": "string"
+					}
+				},
+				"title": {
+					"type": "string",
+					"description": "Window/document title and app brand name shown while this theme is active"
+				},
+				"icon": {
+					"type": "string",
+					"description": "App icon (favicon, window icon, sidebar brand mark): a data: URI, or an image file path relative to this theme JSON"
+				},
+				"css": {
+					"type": "string",
+					"description": "Raw CSS injected only while this theme is active — for background images, animations, anything tokens cannot express"
+				},
+				"video": {
+					"type": "string",
+					"description": "Background video (mp4/webm/mov): a data: URI, or a file path relative to this theme JSON. Plays muted+looping on a fixed layer behind app content — make bg/surface tokens translucent so it shows through"
+				}
+			},
+			"additionalProperties": false
 		}
 	},
 	"additionalProperties": false,

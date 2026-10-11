@@ -19,6 +19,10 @@ export {
 	type RpcForensicEvent,
 	type RpcSkillInfo,
 	type RpcExtensionInfo,
+	type RpcThemeInfo,
+	type RpcExtensionPermissionKind,
+	type RpcExtensionPermissionInfo,
+	type RpcExtensionPermissionState,
 	classifyLine,
 	PROTOCOL_VERSION,
 } from "@tomsun28/pizza-protocol";
@@ -28,6 +32,7 @@ import type {
 	RpcHistoryTreeResult,
 	RpcForensicEvent,
 	RpcSkillInfo,
+	RpcThemeInfo,
 	ScheduledTaskSummary,
 	ScheduledTaskRun,
 	SessionTarget,
@@ -55,6 +60,7 @@ export interface RpcSlashCommand {
 	name: string;
 	description?: string;
 	source: "extension" | "prompt" | "skill";
+	argumentHint?: string;
 	sourceInfo: SourceInfo;
 }
 
@@ -130,6 +136,8 @@ export type RpcResponse =
 			data: { name: string; enabled: boolean; requiresReload: boolean };
 	  }
 	| { id?: string; type: "response"; command: "delete_skill"; success: true; data: { name: string } }
+	| { id?: string; type: "response"; command: "install_skill"; success: true; data: { name: string; path: string } }
+	| { id?: string; type: "response"; command: "get_themes"; success: true; data: { themes: RpcThemeInfo[] } }
 
 	// Scheduled tasks
 	| { id?: string; type: "response"; command: "schedule_list"; success: true; data: { tasks: ScheduledTaskSummary[] } }

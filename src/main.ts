@@ -45,6 +45,7 @@ import { handleBuiltinCommand } from "./builtin-cli.js";
 import { handleUpdateCommand } from "./update-cli.js";
 import { checkForUpdate, formatUpdateNotice } from "./core/update-checker.js";
 import { handleGatewayCommand } from "./gateway-cli.js";
+import { handleChannelCommand } from "./channel-cli.js";
 import { handleAuthCommand } from "./auth-cli.js";
 import { isLocalPath } from "./utils/paths.js";
 
@@ -456,6 +457,10 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
+	if (await handleChannelCommand(args)) {
+		return;
+	}
+
 	if (await handleAuthCommand(args)) {
 		return;
 	}
@@ -499,6 +504,13 @@ export async function main(args: string[], options?: MainOptions) {
 		server.on("duplicate", (sock: string) => {
 			console.error(chalk.yellow(`Gateway: another gateway already owns ${sock}; exiting duplicate.`));
 			process.exit(0);
+		});
+		// Our socket path was stolen by a newer gateway — this process is now
+		// an unreachable zombie. stop() is already running; hard-exit shortly
+		// in case a wedged agent or adapter keeps the event loop alive.
+		server.on("displaced", (sock: string) => {
+			console.error(chalk.yellow(`Gateway: socket ${sock} was taken over by another gateway; exiting.`));
+			setTimeout(() => process.exit(0), 5000).unref();
 		});
 		server.on("error", (error: Error) => {
 			console.error(chalk.red(`Gateway error: ${error.message}`));
@@ -855,15 +867,19 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	printTimings();
-	const exitCode = await runPrintModeWithFacade(created.facade, {
-		mode: toPrintOutputMode(appMode),
-		messages: parsed.messages,
-		initialMessage,
-		initialImages,
-	});
-	stopThemeWatcher();
-	restoreStdout();
-	if (exitCode !== 0) {
-		process.exitCode = exitCode;
+	try {
+		const exitCode = await runPrintModeWithFacade(created.facade, {
+			mode: toPrintOutputMode(appMode),
+			messages: parsed.messages,
+			initialMessage,
+			initialImages,
+		});
+		if (exitCode !== 0) {
+			process.exitCode = exitCode;
+		}
+	} finally {
+		created.facade.dispose();
+		stopThemeWatcher();
+		restoreStdout();
 	}
 }

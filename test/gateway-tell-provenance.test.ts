@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { connect, type Socket } from "node:net";
 import {
 	createGatewayServer,
+	gatewaySocketPath,
 	type GatewayServer,
 	type AgentConnection,
 } from "../packages/gateway/gateway-server.js";
@@ -82,10 +83,7 @@ class RecordingAgent implements AgentConnection {
 }
 
 function uniqueSocketPath(): string {
-	return join(
-		tmpdir(),
-		`pizza-gw-prov-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sock`,
-	);
+	return gatewaySocketPath(`pizza-gw-prov-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, tmpdir());
 }
 
 async function sendAndWait(socketPath: string, message: object, timeoutMs = 3000): Promise<string> {
@@ -165,6 +163,42 @@ describe("gateway tell provenance", () => {
 		// neutralize it from inside the message body.
 		const afterBlock = delivered.slice(delivered.lastIndexOf("</message>"));
 		expect(afterBlock).toContain("crossed a workspace boundary");
+	});
+
+	it("frames external channel sources as outside parties, not workspace traffic", async () => {
+		const cwd = "/proj/web";
+		const fake = await startWithFake(cwd);
+		const res = await sendAndWait(server!.socketPath, {
+			type: "tell",
+			id: "r1b",
+			to: cwd,
+			message: "hi from telegram",
+			from: { kind: "telegram", id: "123456" },
+		});
+		expect(JSON.parse(res).ok).toBe(true);
+		expect(fake.received).toHaveLength(1);
+		const delivered = fake.received[0]!;
+		expect(delivered).toContain('<message from="telegram:123456"');
+		// External channel → outside-party trailer, not the workspace-boundary
+		// wording used for agent-to-agent tells.
+		expect(delivered).toContain('external "telegram" channel');
+		expect(delivered).not.toContain("crossed a workspace boundary");
+	});
+
+	it("renders the sender name attribute when the source carries one", async () => {
+		const cwd = "/proj/web";
+		const fake = await startWithFake(cwd);
+		const res = await sendAndWait(server!.socketPath, {
+			type: "tell",
+			id: "r1c",
+			to: cwd,
+			message: "hi",
+			from: { kind: "lark", id: "oc_abc", name: 'Tom "quoted"' },
+		});
+		expect(JSON.parse(res).ok).toBe(true);
+		const delivered = fake.received[0]!;
+		// Embedded quotes are neutralized so the attr can't break the block.
+		expect(delivered).toContain('<message from="lark:oc_abc" sender="Tom &quot;quoted&quot;"');
 	});
 
 	it("delivers the bare message when `from` is absent (back-compat)", async () => {
@@ -302,8 +336,10 @@ describe("gateway tell provenance", () => {
 	});
 
 	it("relays the told agent's final answer back to the sender automatically", async () => {
-		const targetCwd = "/proj/web";
-		const senderCwd = "/proj/pizza";
+		const dir = mkdtempSync(join(tmpdir(), "pizza-gw-prov-"));
+		dirs.push(dir);
+		const targetCwd = join(dir, "web");
+		const senderCwd = join(dir, "pizza");
 		const target = new RecordingAgent(targetCwd);
 		const sender = new RecordingAgent(senderCwd);
 		target.holdTurn = true;
@@ -311,8 +347,6 @@ describe("gateway tell provenance", () => {
 
 		const socketPath = uniqueSocketPath();
 		sockets.push(socketPath);
-		const dir = mkdtempSync(join(tmpdir(), "pizza-gw-prov-"));
-		dirs.push(dir);
 		server = createGatewayServer({
 			socketPath,
 			agentDir: dir,
@@ -344,7 +378,7 @@ describe("gateway tell provenance", () => {
 		}
 		expect(sender.received).toHaveLength(1);
 		const relayed = sender.received[0]!;
-		expect(relayed).toContain('<message from="agent:/proj/web"');
+		expect(relayed).toContain(`<message from="agent:${targetCwd}"`);
 		expect(relayed).toContain("the answer");
 		// Loop guard: the relayed turn is never relayed again (no reply back to
 		// the target, and the sender's block does not promise auto-relay).

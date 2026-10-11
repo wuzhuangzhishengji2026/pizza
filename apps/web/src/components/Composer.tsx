@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
-import { ArrowUp, Square, Mic, Plus, ChevronDown, Check, X, Loader2, Shield, ShieldCheck, Paperclip, Sparkles, MessageSquarePlus, FolderOpen, Clock } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { ArrowUp, Square, Mic, Plus, ChevronDown, Check, X, Loader2, Shield, ShieldCheck, Paperclip, Sparkles, MessageSquarePlus, FolderOpen, Clock, Terminal, ChevronRight, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { cn, isTauri } from "@/lib/utils";
+import { cn, isTauri, samePath, pathBasename } from "@/lib/utils";
 import {
 	loadFileAttachment,
 	loadPathAttachments,
@@ -11,10 +12,21 @@ import {
 import { FileAttachmentIcon } from "@/components/FileAttachmentIcon";
 import { ScheduleMenu } from "@/components/ScheduleMenu";
 import { MentionMenu, type MentionCategory, type MentionItem } from "@/components/MentionMenu";
+import { SlashMenu } from "@/components/SlashMenu";
+import { Modal } from "@/components/ui";
+import { alertDialog } from "@/lib/confirm";
+import {
+	DESKTOP_BUILTIN_COMMANDS,
+	filterSlashItems,
+	parseSlashInput,
+	slashQueryAt,
+	type BuiltinCommandName,
+	type SlashItem,
+} from "@/lib/slash-commands";
 import { formatFileSize } from "@/lib/file-format";
 
 export type { LoadedFileAttachment } from "@/lib/file-attachment";
-import { sendCommandAwait, setApprovalPolicy, newSession, getSkills, invoke, searchFiles, gitBranches, listScheduledTasks, type SkillInfo, type GitBranchEntry } from "@/lib/transport";
+import { sendCommandAwait, setApprovalPolicy, newSession, getSkills, getCommands, runBash, invoke, searchFiles, gitBranches, listScheduledTasks, type SkillInfo, type SlashCommandInfo, type GitBranchEntry } from "@/lib/transport";
 import type { RpcSessionState, RpcContextUsage, RpcTokenUsage, ModelInfo } from "@/lib/types";
 import type { WorkspaceMeta, ScheduledTaskSummary } from "@/lib/types";
 import { resolveScheduleScope } from "@/lib/schedule-scope";
@@ -257,6 +269,8 @@ export function Composer({
 		};
 	}, []);
 	const [models, setModels] = useState<ModelInfo[]>([]);
+	// Registry size, including unconfigured models (not sent with authOnly).
+	const [modelTotal, setModelTotal] = useState(0);
 	const [recording, setRecording] = useState(false);
 	const [transcribing, setTranscribing] = useState(false);
 	const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -276,6 +290,37 @@ export function Composer({
 	// button open the exact same surface instead of diverging.
 	const [scheduleMenuOpen, setScheduleMenuOpen] = useState(false);
 	const [skills, setSkills] = useState<SkillInfo[]>([]);
+	const navigate = useNavigate();
+
+	// --- / slash command state --------------------------------------------
+	// Typing `/` as the first character opens a command popup (mirrors the
+	// TUI's autocomplete): builtin desktop actions plus the agent-side
+	// commands reported by `get_commands` (skills, prompt templates,
+	// extension commands). `slashQuery` is the text between `/` and the
+	// cursor — the menu only stays open while the cursor is inside the
+	// command token (typing a space ends it and frees @ mentions in args).
+	const [agentCommands, setAgentCommands] = useState<SlashCommandInfo[]>([]);
+	const [slashActive, setSlashActive] = useState(false);
+	const [slashQuery, setSlashQuery] = useState("");
+	const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
+	const slashActiveRef = useRef(false);
+	const slashSelectedIndexRef = useRef(0);
+	const slashQueryRef = useRef<string | null>(null);
+
+	// --- ! bash state -------------------------------------------------------
+	// `!cmd` runs a shell command via the `bash` RPC and shows the result in
+	// a card above the input instead of sending a message (TUI parity).
+	const [bashRunning, setBashRunning] = useState(false);
+	const [bashResult, setBashResult] = useState<{
+		command: string;
+		output: string;
+		exitCode?: number;
+		cancelled: boolean;
+		truncated: boolean;
+	} | null>(null);
+
+	// /export result dialog — shows the written HTML path + reveal button.
+	const [exportResult, setExportResult] = useState<{ path: string } | null>(null);
 
 	// --- @ mention state --------------------------------------------------
 	// When the user types `@` in the textarea we show a popup listing files,
@@ -309,6 +354,40 @@ export function Composer({
 	// be used until the user configures an API key in Settings.
 	const visibleModels = models.filter((m) => m.hasAuth !== false);
 
+	// Model-selector search — the popup filters by name / provider:id as you
+	// type; `/model <query>` prefills this when no exact match exists.
+	const [modelQuery, setModelQuery] = useState("");
+	const [modelMenuIndex, setModelMenuIndex] = useState(0);
+	const modelSearchRef = useRef<HTMLInputElement>(null);
+	const modelItemRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
+
+	const filteredModels = useMemo(() => {
+		const q = modelQuery.trim().toLowerCase();
+		if (!q) return visibleModels;
+		return visibleModels.filter(
+			(m) =>
+				m.name.toLowerCase().includes(q) ||
+				m.id.toLowerCase().includes(q) ||
+				m.provider.toLowerCase().includes(q) ||
+				`${m.provider}/${m.id}`.toLowerCase().includes(q),
+		);
+	}, [visibleModels, modelQuery]);
+
+	// Focus the search box when the model menu opens; reset state on close.
+	useEffect(() => {
+		if (modelMenuOpen) {
+			setModelMenuIndex(0);
+			requestAnimationFrame(() => modelSearchRef.current?.focus());
+		} else {
+			setModelQuery("");
+		}
+	}, [modelMenuOpen]);
+
+	// Keep the keyboard-highlighted model in view while navigating.
+	useEffect(() => {
+		modelItemRefs.current.get(modelMenuIndex)?.scrollIntoView({ block: "nearest" });
+	}, [modelMenuIndex]);
+
 	const hasSpeechSupport =
 		typeof window !== "undefined" &&
 		(isTauri() ||
@@ -320,12 +399,15 @@ export function Composer({
 		let cancelled = false;
 		(async () => {
 			try {
-				const r = await sendCommandAwait<{ models: ModelInfo[] }>(
-					{ type: "get_available_models" },
+				const r = await sendCommandAwait<{ models: ModelInfo[]; total?: number }>(
+					{ type: "get_available_models", authOnly: true },
 					30000,
 				);
 				if (cancelled) return;
-				setModels(r.data?.models ?? []);
+				const list = r.data?.models ?? [];
+				setModels(list);
+				// Older agents ignore authOnly and omit total — they send everything.
+				setModelTotal(r.data?.total ?? list.length);
 			} catch {
 				// Silently ignore — models list will be empty until sidecar recovers.
 			}
@@ -374,7 +456,9 @@ export function Composer({
 		return () => document.removeEventListener("mousedown", onClick);
 	}, [approvalMenuOpen]);
 
-	// Load available skills (invocable as slash commands) for the + menu.
+	// Load available skills (invocable as slash commands) for the + menu, and
+	// the agent-side slash commands (skills / prompt templates / extension
+	// commands) for the `/` popup.
 	useEffect(() => {
 		if (!sidecarReady) return;
 		let cancelled = false;
@@ -383,6 +467,8 @@ export function Composer({
 			// get_skills also reports disabled skills (for the plugins UI); only
 			// enabled ones are actually invocable.
 			if (!cancelled) setSkills(list.filter((skill) => skill.enabled));
+			const commands = await getCommands();
+			if (!cancelled) setAgentCommands(commands);
 		})();
 		return () => {
 			cancelled = true;
@@ -454,7 +540,7 @@ export function Composer({
 
 		// Workspaces.
 		for (const ws of workspaces ?? []) {
-			const name = ws.cwd.replace(/\/+$/, "").split("/").pop() ?? ws.cwd;
+			const name = pathBasename(ws.cwd);
 			items.push({
 				category: "workspace",
 				label: name,
@@ -552,7 +638,8 @@ export function Composer({
 		// The `@` must not be glued to a preceding word character, otherwise
 		// e-mails (`a@b.com`) and scoped paths would pop the menu open. We check
 		// for ASCII word/path characters rather than requiring whitespace: CJK
-		// text has no spaces, so `帮我看看@Composer` must still trigger the menu.
+		// text has no spaces, so `帮我看看@Composer` ("take a look @Composer"
+		// with no spaces) must still trigger the menu.
 		if (atIdx > 0 && /[A-Za-z0-9._~-]/.test(before[atIdx - 1])) {
 			closeMention();
 			return;
@@ -636,9 +723,9 @@ export function Composer({
 
 	// Approval policy for the current session (two states). Selected inline in
 	// the composer so the user can choose per-session without visiting Settings.
-	// "off" (自动) auto-runs everything; "auto" (审批, default) gates only
-	// unknown tools and dangerous commands. Legacy "on" (strict) settings map
-	// to 审批 in the UI.
+	// "off" (自动 "automatic") auto-runs everything; "auto" (审批 "approval",
+	// default) gates only unknown tools and dangerous commands. Legacy "on"
+	// (strict) settings map to 审批 ("approval") in the UI.
 	const approvalPolicy = state?.approvalPolicy ?? (state?.safeMode ? "on" : "auto");
 	const gated = approvalPolicy !== "off";
 	const handleApprovalPolicyChange = useCallback(async (policy: "auto" | "off") => {
@@ -673,6 +760,173 @@ ${insert}`;
 		});
 		// Refocus the textarea so the user can continue typing arguments.
 		requestAnimationFrame(() => textareaRef.current?.focus());
+	}, []);
+
+	// --- / slash command menu ----------------------------------------------
+
+	const closeSlash = useCallback(() => {
+		setSlashActive(false);
+		slashQueryRef.current = null;
+	}, []);
+
+	// Track the `/`-command token while the cursor stays inside it.
+	const detectSlash = useCallback(
+		(value: string, cursorPos: number) => {
+			const query = slashQueryAt(value, cursorPos);
+			if (query === null) {
+				closeSlash();
+				return;
+			}
+			setSlashActive(true);
+			if (slashQueryRef.current !== query) {
+				slashQueryRef.current = query;
+				setSlashQuery(query);
+				setSlashSelectedIndex(0);
+			}
+		},
+		[closeSlash],
+	);
+
+	// Full item pool: desktop builtins first (i18n descriptions), then the
+	// agent-side commands. Builtin names win collisions with extension
+	// commands — same precedence as the TUI's builtin intercept.
+	const slashItems = useMemo<SlashItem[]>(() => {
+		const items: SlashItem[] = DESKTOP_BUILTIN_COMMANDS.map((def) => ({
+			category: "builtin",
+			name: def.name,
+			description: t(`slash.builtin.${def.name}`),
+		}));
+		const builtinNames = new Set<string>(DESKTOP_BUILTIN_COMMANDS.map((d) => d.name));
+		for (const command of agentCommands) {
+			if (builtinNames.has(command.name)) continue;
+			items.push({
+				category: command.source,
+				name: command.name,
+				description: command.description,
+				hint: command.argumentHint,
+			});
+		}
+		return items;
+	}, [agentCommands, t]);
+
+	const filteredSlashItems = useMemo(
+		() => filterSlashItems(slashItems, slashQuery),
+		[slashItems, slashQuery],
+	);
+	const filteredSlashItemsRef = useRef(filteredSlashItems);
+	filteredSlashItemsRef.current = filteredSlashItems;
+	slashActiveRef.current = slashActive;
+	slashSelectedIndexRef.current = slashSelectedIndex;
+
+	// Execute a desktop builtin. Arg-taking commands arrive here on submit;
+	// no-arg commands can also arrive directly from menu selection.
+	const dispatchBuiltin = useCallback(
+		async (name: BuiltinCommandName, args: string) => {
+			switch (name) {
+				case "settings":
+					navigate("/settings");
+					return;
+				case "new":
+					await handleNewSession();
+					return;
+				case "model": {
+					if (!args) {
+						setModelMenuOpen(true);
+						return;
+					}
+					// `/model <query>` — pick the best fuzzy match like the TUI.
+					const q = args.toLowerCase();
+					const match =
+						visibleModels.find((m) => `${m.provider}/${m.id}`.toLowerCase() === q) ??
+						visibleModels.find((m) => m.id.toLowerCase() === q) ??
+						visibleModels.find((m) => `${m.provider}/${m.id}`.toLowerCase().includes(q)) ??
+						visibleModels.find((m) => m.id.toLowerCase().includes(q));
+					if (match) {
+						await handleModelSelect(match);
+					} else {
+						// No match — open the selector pre-filtered with the query.
+						setModelQuery(args);
+						setModelMenuOpen(true);
+					}
+					return;
+				}
+				case "compact": {
+					try {
+						// The agent waits for COMPACTION_END internally (30s cap).
+						await sendCommandAwait({ type: "compact" }, 35000);
+					} catch (e) {
+						void alertDialog({
+							title: t("slash.compactFailed"),
+							message: e instanceof Error ? e.message : String(e),
+						});
+					}
+					return;
+				}
+				case "export": {
+					try {
+						const r = await sendCommandAwait<{ path: string }>(
+							{ type: "export_html", ...(args && { outputPath: args }) },
+							60000,
+						);
+						if (r.data?.path) setExportResult({ path: r.data.path });
+					} catch (e) {
+						void alertDialog({
+							title: t("slash.exportFailed"),
+							message: e instanceof Error ? e.message : String(e),
+						});
+					}
+					return;
+				}
+			}
+		},
+		[navigate, handleNewSession, visibleModels, handleModelSelect, t],
+	);
+
+	const handleSlashSelect = useCallback(
+		(item: SlashItem) => {
+			closeSlash();
+			if (item.category === "builtin") {
+				const def = DESKTOP_BUILTIN_COMMANDS.find((d) => d.name === item.name);
+				if (def && !def.takesArgs) {
+					setInput("");
+					void dispatchBuiltin(def.name, "");
+					return;
+				}
+			}
+			// Arg-taking builtins and agent commands: complete the command name
+			// and let the user type arguments before sending.
+			setInput(`/${item.name} `);
+			requestAnimationFrame(() => {
+				const el = textareaRef.current;
+				if (el) {
+					el.focus();
+					const pos = el.value.length;
+					el.setSelectionRange(pos, pos);
+				}
+			});
+		},
+		[closeSlash, dispatchBuiltin],
+	);
+
+	// --- ! bash execution ---------------------------------------------------
+
+	const runBashCommand = useCallback(async (command: string) => {
+		setBashRunning(true);
+		setBashResult({ command, output: "", cancelled: false, truncated: false });
+		try {
+			const r = await runBash(command);
+			setBashResult({ command, ...r });
+		} catch (e) {
+			setBashResult({
+				command,
+				output: e instanceof Error ? e.message : String(e),
+				exitCode: 1,
+				cancelled: false,
+				truncated: false,
+			});
+		} finally {
+			setBashRunning(false);
+		}
 	}, []);
 
 	const startRecording = useCallback(() => {
@@ -936,7 +1190,7 @@ ${insert}`;
 	useEffect(() => {
 		const onPrefill = (e: Event) => {
 			const detail = (e as CustomEvent<ComposerPrefillDetail>).detail;
-			if (!detail || detail.workspace !== (workspace ?? "")) return;
+			if (!detail || !samePath(detail.workspace, workspace ?? "")) return;
 			setInput((prev) => (prev.trim() ? prev.trimEnd() + " " : "") + detail.text);
 			requestAnimationFrame(() => textareaRef.current?.focus());
 		};
@@ -1037,6 +1291,35 @@ ${insert}`;
 
 	const handleSend = () => {
 		const message = input.trim();
+		if (!sidecarReady) return;
+
+		// `/` builtin — intercepted locally like the TUI's builtin dispatch.
+		// Non-builtin `/name args` falls through to onSend so the agent can
+		// run extension commands and expand skills/prompt templates.
+		const slash = message ? parseSlashInput(message) : null;
+		if (slash) {
+			const def = DESKTOP_BUILTIN_COMMANDS.find((d) => d.name === slash.name);
+			if (def) {
+				setInput("");
+				void dispatchBuiltin(def.name, slash.args);
+				return;
+			}
+		}
+
+		// `!cmd` — run the shell command locally and show its output card.
+		if (message.startsWith("!")) {
+			const command = message.slice(message.startsWith("!!") ? 2 : 1).trim();
+			if (command) {
+				if (!bashRunning) {
+					setInput("");
+					setImages([]);
+					setFiles([]);
+					void runBashCommand(command);
+				}
+				return;
+			}
+		}
+
 		// Pass images and files through as separate RPC fields — the user
 		// message text is sent verbatim. Image attachments go through the
 		// dedicated `images` field; non-image files are path references
@@ -1057,11 +1340,11 @@ ${insert}`;
 		sidecarReady && (!!input.trim() || images.length > 0 || files.length > 0);
 
 	return (
-		<div className="bg-surface px-6 py-4">
+		<div className="bg-bg px-6 py-4">
 			<div className="mx-auto max-w-3xl">
 				<div
 					className={cn(
-						"relative rounded-3xl border border-border bg-surface-2 px-4 pt-3 pb-2 shadow-sm transition-colors focus-within:border-accent/60",
+						"relative rounded-2xl border border-border bg-bg px-4 pt-3 pb-2 shadow-[0_1px_6px_rgb(0_0_0/0.04)] transition-colors focus-within:border-muted/70",
 						!sidecarReady && "opacity-60",
 						isDragOver && "border-accent ring-2 ring-accent/40",
 					)}
@@ -1071,7 +1354,7 @@ ${insert}`;
 					onDrop={onDrop}
 				>
 					{isDragOver && (
-						<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-3xl bg-accent/10">
+						<div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-accent/10">
 							<div className="rounded-full border border-accent/40 bg-surface px-4 py-2 text-xs font-medium text-accent shadow-md">
 								{t("composer.dropFiles")}
 							</div>
@@ -1132,6 +1415,49 @@ ${insert}`;
 							))}
 						</div>
 					)}
+					{bashResult && (
+						<div className="mb-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs">
+							<div className="flex items-center justify-between gap-2">
+								<span className="flex min-w-0 items-center gap-1.5 font-medium text-fg">
+									<Terminal className="h-3.5 w-3.5 shrink-0 text-muted" />
+									<ChevronRight className="h-3 w-3 shrink-0 text-muted" />
+									<span className="truncate font-mono">{bashResult.command}</span>
+								</span>
+								<span className="flex shrink-0 items-center gap-2">
+									{bashRunning ? (
+										<span className="flex items-center gap-1 text-muted">
+											<Loader2 className="h-3 w-3 animate-spin" />
+											{t("slash.bashRunning")}
+										</span>
+									) : (
+										<>
+											{bashResult.cancelled ? (
+												<span className="text-warning">{t("slash.bashCancelled")}</span>
+											) : bashResult.exitCode !== undefined && bashResult.exitCode !== 0 ? (
+												<span className="text-danger">{t("slash.bashExitCode", { code: bashResult.exitCode })}</span>
+											) : null}
+										</>
+									)}
+									<button
+										type="button"
+										onClick={() => setBashResult(null)}
+										className="text-muted hover:text-fg"
+										title={t("common.dismiss")}
+									>
+										<X className="h-3 w-3" />
+									</button>
+								</span>
+							</div>
+							{(bashRunning || bashResult.output) && (
+								<pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-muted">
+									{bashResult.output || " "}
+								</pre>
+							)}
+							{bashResult.truncated && (
+								<div className="mt-1 text-[10px] text-warning">{t("slash.bashTruncated")}</div>
+							)}
+						</div>
+					)}
 					{rejected.length > 0 && (
 						<div className="mb-2 rounded-lg border border-warning/40 bg-warning/5 px-3 py-2 text-xs text-warning">
 							<div className="flex items-center justify-between gap-2">
@@ -1175,19 +1501,69 @@ ${insert}`;
 							onChange={(e) => {
 								setInput(e.target.value);
 								detectMention(e.target.value, e.target.selectionStart ?? 0);
+								detectSlash(e.target.value, e.target.selectionStart ?? 0);
 							}}
 							onKeyUp={(e) => {
 								// Re-detect on cursor movement keys (arrows, Home, End).
 								if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") {
 									detectMention(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
+									detectSlash(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
 								}
 							}}
 							onClick={(e) => {
 								// Clicking moves the cursor — re-evaluate mention state.
 								detectMention(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
+								detectSlash(e.currentTarget.value, e.currentTarget.selectionStart ?? 0);
 							}}
 							onPaste={handlePaste}
 							onKeyDown={(e) => {
+								// Slash menu is open while the cursor is inside the leading
+								// `/command` token — it owns the nav/commit keys first.
+								if (slashActiveRef.current) {
+									const filtered = filteredSlashItemsRef.current;
+									if (e.key === "Escape") {
+										e.preventDefault();
+										closeSlash();
+										return;
+									}
+									if (filtered.length > 0) {
+										if (e.key === "ArrowDown") {
+											e.preventDefault();
+											e.stopPropagation();
+											setSlashSelectedIndex((prev) => Math.min(prev + 1, filtered.length - 1));
+											return;
+										}
+										if (e.key === "ArrowUp") {
+											e.preventDefault();
+											e.stopPropagation();
+											setSlashSelectedIndex((prev) => Math.max(prev - 1, 0));
+											return;
+										}
+										if (e.key === "Tab") {
+											e.preventDefault();
+											e.stopPropagation();
+											const idx = Math.min(slashSelectedIndexRef.current, filtered.length - 1);
+											const item = filtered[idx];
+											if (item) handleSlashSelect(item);
+											return;
+										}
+										// Enter falls through to handleSend when the input is
+										// already a complete command; otherwise complete the
+										// highlighted item like Tab does.
+										if (e.key === "Enter" && !e.shiftKey) {
+											const parsed = parseSlashInput(input);
+											const exact = filtered.find((i) => i.name === parsed?.name);
+											if (!exact) {
+												e.preventDefault();
+												e.stopPropagation();
+												const idx = Math.min(slashSelectedIndexRef.current, filtered.length - 1);
+												const item = filtered[idx];
+												if (item) handleSlashSelect(item);
+												return;
+											}
+										}
+									}
+								}
 								// When the mention menu is open, intercept navigation keys.
 								// Use refs to read the latest state — the inline handler
 								// closure can be stale if it was created during a render
@@ -1239,6 +1615,14 @@ ${insert}`;
 								selectedIndex={mentionSelectedIndex}
 								onSelect={handleMentionSelect}
 								onNavigate={setMentionSelectedIndex}
+							/>
+						)}
+						{slashActive && (
+							<SlashMenu
+								items={filteredSlashItems}
+								selectedIndex={slashSelectedIndex}
+								onSelect={handleSlashSelect}
+								onNavigate={setSlashSelectedIndex}
 							/>
 						)}
 					</div>
@@ -1308,7 +1692,7 @@ ${insert}`;
 										{skills.length > 0 && (
 											<>
 												<div className="my-1 border-t border-border/60" />
-												<div className="px-2.5 py-1 text-[10px] uppercase tracking-wider text-muted">
+												<div className="px-2.5 py-1 text-[11px] font-medium text-muted">
 													{t("composer.skills")}
 												</div>
 												<div className="max-h-52 overflow-y-auto">
@@ -1413,38 +1797,80 @@ ${insert}`;
 									<ChevronDown className="h-3.5 w-3.5" />
 								</button>
 								{modelMenuOpen && visibleModels.length > 0 && (
-									<div className={cn("absolute bottom-full right-0 mb-2 max-h-80 w-64 overflow-y-auto rounded-xl border border-border bg-surface p-1 shadow-lg", Z.menu)}>
-										{visibleModels.map((m) => {
-											const key = `${m.provider}:${m.id}`;
-											const selected = displayedModel
-												? m.provider === displayedModel.provider && m.id === displayedModel.id
-												: false;
-											return (
-												<button
-													key={key}
-													type="button"
-													onClick={() => handleModelSelect(m)}
-													className={cn(
-														"flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors",
-														"hover:bg-surface-2",
-														selected ? "text-fg" : "text-muted",
-													)}
-												>
-													<span className="min-w-0 flex-1">
-														<span className="block truncate text-fg">{m.name}</span>
-														<span className="block truncate font-mono text-[10px] text-muted">
-															{m.provider}
-														</span>
-													</span>
-													{selected ? (
-														<Check className="h-3.5 w-3.5 shrink-0 text-accent" />
-													) : null}
-												</button>
-											);
-										})}
+									<div className={cn("absolute bottom-full right-0 mb-2 w-64 rounded-xl border border-border bg-surface p-1 shadow-lg", Z.menu)}>
+										{/* Search — autofocused on open; ↑/↓+Enter pick from the filtered list */}
+										<div className="flex items-center gap-1.5 border-b border-border/60 px-2.5 pb-1.5">
+											<Search className="h-3.5 w-3.5 shrink-0 text-muted" />
+											<input
+												ref={modelSearchRef}
+												value={modelQuery}
+												onChange={(e) => {
+													setModelQuery(e.target.value);
+													setModelMenuIndex(0);
+												}}
+												onKeyDown={(e) => {
+													if (e.key === "ArrowDown") {
+														e.preventDefault();
+														setModelMenuIndex((i) => Math.min(i + 1, filteredModels.length - 1));
+													} else if (e.key === "ArrowUp") {
+														e.preventDefault();
+														setModelMenuIndex((i) => Math.max(i - 1, 0));
+													} else if (e.key === "Enter") {
+														e.preventDefault();
+														const m = filteredModels[Math.min(modelMenuIndex, filteredModels.length - 1)];
+														if (m) void handleModelSelect(m);
+													} else if (e.key === "Escape") {
+														e.preventDefault();
+														setModelMenuOpen(false);
+														textareaRef.current?.focus();
+													}
+												}}
+												placeholder={t("composer.searchModels")}
+												className="w-full bg-transparent py-1 text-xs text-fg outline-none placeholder:text-muted"
+											/>
+										</div>
+										<div className="max-h-64 overflow-y-auto pt-1">
+											{filteredModels.length === 0 ? (
+												<div className="px-2.5 py-2 text-[11px] text-muted">{t("composer.noModelMatches")}</div>
+											) : (
+												filteredModels.map((m, i) => {
+													const key = `${m.provider}:${m.id}`;
+													const selected = displayedModel
+														? m.provider === displayedModel.provider && m.id === displayedModel.id
+														: false;
+													const highlighted = i === modelMenuIndex;
+													return (
+														<button
+															key={key}
+															ref={(el) => {
+																if (el) modelItemRefs.current.set(i, el);
+															}}
+															type="button"
+															onClick={() => handleModelSelect(m)}
+															onMouseMove={() => setModelMenuIndex(i)}
+															className={cn(
+																"flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors",
+																highlighted ? "bg-surface-2" : "hover:bg-surface-2",
+																selected ? "text-fg" : "text-muted",
+															)}
+														>
+															<span className="min-w-0 flex-1">
+																<span className="block truncate text-fg">{m.name}</span>
+																<span className="block truncate text-[10px] text-muted">
+																	{m.provider}
+																</span>
+															</span>
+															{selected ? (
+																<Check className="h-3.5 w-3.5 shrink-0 text-accent" />
+															) : null}
+														</button>
+													);
+												})
+											)}
+										</div>
 									{/* Thinking level — controls reasoning effort for the current model */}
 									<div className="mt-1 border-t border-border/60 pt-1">
-										<div className="px-2.5 py-1 text-[10px] font-medium uppercase tracking-wide text-muted">
+										<div className="px-2.5 py-1 text-[11px] font-medium text-muted">
 											{t("composer.thinkingLevel")}
 										</div>
 										<div className="flex flex-wrap gap-1 px-1.5 pb-1">
@@ -1467,7 +1893,7 @@ ${insert}`;
 									</div>
 								</div>
 							)}
-							{modelMenuOpen && visibleModels.length === 0 && models.length > 0 && (
+							{modelMenuOpen && visibleModels.length === 0 && modelTotal > 0 && (
 									<div className={cn("absolute bottom-full right-0 mb-2 w-64 rounded-xl border border-border bg-surface p-1 shadow-lg", Z.menu)}>
 										<a
 											href="/#/settings"
@@ -1536,10 +1962,39 @@ ${insert}`;
 						</div>
 					</div>
 				</div>
-				<div className="mt-2 text-center font-mono text-[10px] uppercase tracking-widest text-muted">
+				<div className="mt-2 text-center text-[11px] text-muted">
 					{t("composer.sendHint")}
 				</div>
 			</div>
+			<Modal
+				open={exportResult !== null}
+				onClose={() => setExportResult(null)}
+				title={t("slash.exportDone")}
+				size="md"
+				footer={
+					<>
+						<button
+							type="button"
+							onClick={() => {
+								if (exportResult) revealInFinder(exportResult.path);
+								setExportResult(null);
+							}}
+							className="rounded-md border border-border bg-surface-2 px-3 py-1.5 text-sm text-fg transition-colors hover:bg-surface-2/80"
+						>
+							{t("composer.revealInFinder")}
+						</button>
+						<button
+							type="button"
+							onClick={() => setExportResult(null)}
+							className="rounded-md border border-accent bg-accent/15 px-3 py-1.5 text-sm text-accent transition-colors hover:bg-accent/25"
+						>
+							{t("common.confirm")}
+						</button>
+					</>
+				}
+			>
+				<p className="break-all font-mono text-xs">{exportResult?.path}</p>
+			</Modal>
 		</div>
 	);
 }

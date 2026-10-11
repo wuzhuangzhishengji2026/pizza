@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqliteEventStore } from "../src/core/event-store/sqlite-store.js";
 import type { ContentBlock, EventBase } from "../src/core/event-store/types.js";
@@ -11,6 +11,8 @@ import { ModelRegistry as RealModelRegistry } from "../src/core/model-registry.j
 import { SessionManager } from "../src/core/projection/session-manager.js";
 import type { LLMClient, LLMResponse } from "../src/core/runtime/llm-types.js";
 import { EventSourcedRuntime } from "../src/core/runtime/runtime.js";
+import { DefaultPackageManager } from "../src/core/package-manager.js";
+import type { ResourceLoader } from "../src/core/resource-loader.js";
 import { SessionFacade } from "../src/core/session-facade.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { runRpcModeWithFacade } from "../packages/rpc/rpc-mode.js";
@@ -41,30 +43,34 @@ vi.mock("../packages/rpc/jsonl.js", () => ({
 }));
 
 const execMock = vi.hoisted(() => ({
-	// Whether the agent-browser CLI is "on PATH". Install sets it true, uninstall false.
-	installed: false,
-	reset(installed = false) {
-		this.installed = installed;
+	// Isolated PATH dir: the agent-browser install check looks for an
+	// executable there (it never spawns the CLI). Install creates it, uninstall removes it.
+	binDir: "",
+	async setInstalled(installed: boolean) {
+		const { chmodSync, rmSync, writeFileSync } = await import("node:fs");
+		const bin = `${this.binDir}/agent-browser`;
+		if (installed) {
+			writeFileSync(bin, "#!/bin/sh\n");
+			chmodSync(bin, 0o755);
+			if (process.platform === "win32") writeFileSync(`${bin}.cmd`, "@echo off\r\n");
+		} else {
+			rmSync(bin, { force: true });
+			rmSync(`${bin}.cmd`, { force: true });
+		}
 	},
 }));
 
 vi.mock("../src/core/exec.js", () => ({
 	execCommand: vi.fn(async (command: string, args: string[]) => {
 		const key = `${command}:${args[0]}`;
-		// version probe reflects install state
-		if (key === "agent-browser:--version") {
-			return execMock.installed
-				? { stdout: "0.0.0-mock", stderr: "", code: 0 }
-				: { stdout: "", stderr: "not found", code: 127 };
-		}
-		// installing the CLI succeeds and flips install state on
+		// installing the CLI succeeds and puts it on PATH
 		if (key === "npm:install" || key === "agent-browser:install") {
-			execMock.installed = true;
+			await execMock.setInstalled(true);
 			return { stdout: "", stderr: "", code: 0 };
 		}
-		// uninstalling flips install state off
+		// uninstalling removes it from PATH
 		if (key === "npm:uninstall") {
-			execMock.installed = false;
+			await execMock.setInstalled(false);
 			return { stdout: "", stderr: "", code: 0 };
 		}
 		return { stdout: "", stderr: `mock: ${key} not handled`, code: 127 };
@@ -72,6 +78,7 @@ vi.mock("../src/core/exec.js", () => ({
 }));
 
 const tempDirs: string[] = [];
+const openFacades: SessionFacade[] = [];
 
 const emptyRegistry: ToolRegistry = {
 	get: () => undefined,
@@ -95,7 +102,7 @@ function makeTextResponse(text: string): LLMResponse {
 	};
 }
 
-function createFacade(client?: LLMClient, modelRegistry?: ModelRegistry): SessionFacade {
+function createFacade(client?: LLMClient, modelRegistry?: ModelRegistry, resourceLoader?: ResourceLoader): SessionFacade {
 	const cwd = makeTempDir();
 	const store = new SqliteEventStore(`rpc-facade-${Date.now()}`, join(cwd, "events.sqlite"));
 	const sessionManager = new SessionManager(store, store);
@@ -115,12 +122,15 @@ function createFacade(client?: LLMClient, modelRegistry?: ModelRegistry): Sessio
 		model: { provider: "test", model_id: "test-model" },
 		tools: [],
 	});
-	return new SessionFacade({
+	const facade = new SessionFacade({
 		runtime,
 		settingsManager: SettingsManager.inMemory({ defaultProvider: "test", defaultModel: "test-model" }),
 		modelRegistry,
+		resourceLoader,
 		disposers: [() => store.close()],
 	});
+	openFacades.push(facade);
+	return facade;
 }
 
 function parseOutputLines(): Array<Record<string, unknown>> {
@@ -131,21 +141,31 @@ function parseOutputLines(): Array<Record<string, unknown>> {
 }
 
 describe("runRpcModeWithFacade", () => {
-	let originalPizzaHome: string | undefined;
+	const pathEnvKeys = ["PIZZA_HOME", "PATH", "PIZZA_LOGIN_SHELL_PATH", "PIZZA_LOGIN_SHELL_PATH_AT"] as const;
+	let originalEnv: Partial<Record<(typeof pathEnvKeys)[number], string>> = {};
 
 	beforeEach(() => {
+		originalEnv = Object.fromEntries(pathEnvKeys.map((k) => [k, process.env[k]]));
 		// Isolate ALL ~/.pizza writes (scheduler tasks.json, runs.jsonl, ...).
 		// Without this, scheduled-task tests pollute the real user home with
 		// rpc-facade-* workspace dirs containing live-looking tasks.
-		originalPizzaHome = process.env.PIZZA_HOME;
 		process.env.PIZZA_HOME = makeTempDir();
+		// PATH holds only a temp dir, and the login-shell PATH is pre-seeded as
+		// empty, so a real agent-browser on the dev machine can't leak in.
+		execMock.binDir = makeTempDir();
+		process.env.PATH = execMock.binDir;
+		process.env.PIZZA_LOGIN_SHELL_PATH = "";
+		process.env.PIZZA_LOGIN_SHELL_PATH_AT = String(Date.now());
 	});
 
 	afterEach(() => {
-		if (originalPizzaHome === undefined) delete process.env.PIZZA_HOME;
-		else process.env.PIZZA_HOME = originalPizzaHome;
+		for (const key of pathEnvKeys) {
+			if (originalEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = originalEnv[key];
+		}
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
+		for (const facade of openFacades.splice(0)) facade.dispose();
 		for (const dir of tempDirs.splice(0)) {
 			if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 		}
@@ -651,6 +671,200 @@ describe("runRpcModeWithFacade", () => {
 		facade.dispose();
 	});
 
+	it("reload_providers recovers when the current model becomes unresolvable (provider removed mid-session)", async () => {
+		// Reproduces the gateway-mode trap: the facade started with a real model,
+		// then the provider was deleted from models.json while the agent kept
+		// running (e.g. the user reconfigured providers in the Settings UI).
+		// get_state returns model=undefined and, since gateway agents can't be
+		// respawned by restart_sidecar, nothing ever re-resolves — the GUI
+		// bounces the user back to the setup page forever. reload_providers
+		// must treat a dangling model like the "none" placeholder and pick a
+		// real model once credentials allow it.
+		const dir = makeTempDir();
+		const authJsonPath = join(dir, "auth.json");
+		const modelsJsonPath = join(dir, "models.json");
+		writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					openai: {
+						baseUrl: "https://api.openai.com/v1",
+						api: "openai-responses",
+						apiKey: "openai", // auth-only override on a built-in provider
+					},
+				},
+			}),
+		);
+
+		const authStorage = AuthStorage.create(authJsonPath);
+		const modelRegistry = RealModelRegistry.create(authStorage, modelsJsonPath);
+
+		// Facade holds a model whose provider no longer exists in the registry —
+		// e.g. settings.json's defaultProvider pointed at a provider that has
+		// since been removed. Not "none": the placeholder-only recovery path
+		// must not be the only escape hatch.
+		const cwd = makeTempDir();
+		const store = new SqliteEventStore(`rpc-dangling-${Date.now()}`, join(cwd, "events.sqlite"));
+		const sessionManager = new SessionManager(store, store);
+		sessionManager.createSession("user_explicit", "Initial");
+		const runtime = new EventSourcedRuntime({
+			cwd,
+			agentDir: cwd,
+			store,
+			sessionManager,
+			toolRegistry: emptyRegistry,
+			llmClient: { async complete() { return makeTextResponse("ok"); } },
+			systemPrompt: "dangling model test",
+			model: { provider: "removed-provider", model_id: "removed-model" },
+			tools: [],
+		});
+		const facade = new SessionFacade({
+			runtime,
+			settingsManager: SettingsManager.inMemory({}),
+			modelRegistry,
+			disposers: [() => store.close()],
+		});
+		void runRpcModeWithFacade(facade);
+		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+
+		// Before reload: the dangling model resolves to nothing → model=undefined,
+		// which is what traps the GUI in the setup page.
+		rpcIo.lineHandler!(JSON.stringify({ id: "state-1", type: "get_state" }));
+		await vi.waitFor(() => {
+			const stateResp = parseOutputLines().find((l) => l.id === "state-1");
+			expect(stateResp).toBeDefined();
+			expect((stateResp as { data?: { model?: unknown } }).data?.model).toBeUndefined();
+		});
+
+		// User reconfigures providers via the Settings UI; the bridge writes
+		// auth.json (key for the surviving provider) and broadcasts
+		// reload_providers.
+		writeFileSync(authJsonPath, JSON.stringify({ openai: { type: "api_key", key: "sk-test-key" } }, null, 2));
+		rpcIo.lineHandler!(JSON.stringify({ id: "reload-1", type: "reload_providers" }));
+		await vi.waitFor(() => {
+			expect(parseOutputLines()).toContainEqual(
+				expect.objectContaining({
+					id: "reload-1",
+					type: "response",
+					command: "reload_providers",
+					success: true,
+					data: { providers: ["openai"] },
+				}),
+			);
+		});
+
+		// After reload: the facade switched to a resolvable model.
+		rpcIo.lineHandler!(JSON.stringify({ id: "state-2", type: "get_state" }));
+		await vi.waitFor(() => {
+			const stateResp = parseOutputLines().find((l) => l.id === "state-2");
+			expect(stateResp).toBeDefined();
+			const model = (stateResp as { data?: { model?: { provider?: string } } }).data?.model;
+			expect(model).toBeDefined();
+			expect(model?.provider).toBe("openai");
+		});
+
+		// A model that still resolves must NOT be yanked on subsequent reloads.
+		const modelId = facade.model.model_id;
+		rpcIo.lineHandler!(JSON.stringify({ id: "reload-2", type: "reload_providers" }));
+		await vi.waitFor(() => {
+			expect(parseOutputLines()).toContainEqual(
+				expect.objectContaining({ id: "reload-2", type: "response", command: "reload_providers", success: true }),
+			);
+		});
+		rpcIo.lineHandler!(JSON.stringify({ id: "state-3", type: "get_state" }));
+		await vi.waitFor(() => {
+			const stateResp = parseOutputLines().find((l) => l.id === "state-3");
+			expect(stateResp).toBeDefined();
+			const model = (stateResp as { data?: { model?: { provider?: string; id?: string } } }).data?.model;
+			expect(model?.provider).toBe("openai");
+			expect(model?.id).toBe(modelId);
+		});
+
+		facade.dispose();
+	});
+
+	it("get_available_models with authOnly sends only configured models plus the registry total", async () => {
+		const all = [
+			{ provider: "a", id: "m1", name: "M1", api: "x" },
+			{ provider: "b", id: "m2", name: "M2", api: "x" },
+			{ provider: "b", id: "m3", name: "M3", api: "x" },
+		];
+		const modelRegistry = {
+			getAll: () => all,
+			getAvailable: () => all,
+			find: (provider: string, modelId: string) => all.find((m) => m.provider === provider && m.id === modelId),
+			hasConfiguredAuth: (m: { provider: string }) => m.provider === "a",
+		} as unknown as ModelRegistry;
+		const facade = createFacade(undefined, modelRegistry);
+		void runRpcModeWithFacade(facade);
+		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+
+		rpcIo.lineHandler!(JSON.stringify({ id: "models-all", type: "get_available_models" }));
+		rpcIo.lineHandler!(JSON.stringify({ id: "models-auth", type: "get_available_models", authOnly: true }));
+		await vi.waitFor(() => {
+			const records = parseOutputLines();
+			const full = records.find((r) => r.id === "models-all")?.data as { models: Array<{ id: string }>; total: number };
+			const authed = records.find((r) => r.id === "models-auth")?.data as { models: Array<{ id: string; hasAuth: boolean }>; total: number };
+			expect(full.models.map((m) => m.id)).toEqual(["m1", "m2", "m3"]);
+			expect(full.total).toBe(3);
+			expect(authed.models).toEqual([expect.objectContaining({ id: "m1", hasAuth: true })]);
+			expect(authed.total).toBe(3);
+		});
+
+		facade.dispose();
+	});
+
+	it("get_commands returns prompt templates and skill commands alongside extensions", async () => {
+		const resourceLoader = {
+			getPrompts: () => ({
+				prompts: [
+					{
+						name: "review",
+						description: "Review code",
+						argumentHint: "<file>",
+						content: "review it",
+						filePath: "/tmp/prompts/review.md",
+						sourceInfo: {},
+					},
+				],
+				diagnostics: [],
+			}),
+			getSkills: () => ({
+				skills: [
+					{
+						name: "lark",
+						description: "Feishu helpers",
+						filePath: "/tmp/skills/lark/SKILL.md",
+						baseDir: "/tmp/skills/lark",
+						sourceInfo: {},
+						disableModelInvocation: false,
+					},
+				],
+				diagnostics: [],
+			}),
+		} as unknown as ResourceLoader;
+		const facade = createFacade(undefined, undefined, resourceLoader);
+		void runRpcModeWithFacade(facade);
+		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+
+		rpcIo.lineHandler!(JSON.stringify({ id: "cmds-1", type: "get_commands" }));
+		await vi.waitFor(() => {
+			const response = parseOutputLines().find((r) => r.id === "cmds-1");
+			expect(response).toEqual(expect.objectContaining({ command: "get_commands", success: true }));
+			const commands = (response?.data as {
+				commands: Array<{ name: string; source: string; argumentHint?: string }>;
+			}).commands;
+			expect(commands).toContainEqual(
+				expect.objectContaining({ name: "review", source: "prompt", argumentHint: "<file>" }),
+			);
+			expect(commands).toContainEqual(
+				expect.objectContaining({ name: "skill:lark", source: "skill" }),
+			);
+		});
+
+		facade.dispose();
+	});
+
 	it("get_extensions returns extensions (empty when no resource loader)", async () => {
 		const facade = createFacade();
 		void runRpcModeWithFacade(facade);
@@ -680,6 +894,44 @@ describe("runRpcModeWithFacade", () => {
 		facade.dispose();
 	});
 
+	it.skipIf(process.platform === "win32")(
+		"get_extensions detects agent-browser on PATH and reads its version from package.json without spawning it",
+		async () => {
+			const { execCommand } = await import("../src/core/exec.js");
+			// Mirror an npm global install: <prefix>/bin/agent-browser -> lib/node_modules/agent-browser/bin/<native>
+			const prefix = makeTempDir();
+			const pkgDir = join(prefix, "lib", "node_modules", "agent-browser");
+			mkdirSync(join(pkgDir, "bin"), { recursive: true });
+			mkdirSync(join(prefix, "bin"));
+			writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "agent-browser", version: "9.8.7" }));
+			const native = join(pkgDir, "bin", "agent-browser-native");
+			writeFileSync(native, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+			symlinkSync(native, join(prefix, "bin", "agent-browser"));
+			process.env.PATH = `${execMock.binDir}${delimiter}${join(prefix, "bin")}`;
+			vi.mocked(execCommand).mockClear();
+
+			const { checkBrowserAvailable } = await import("../src/builtin-extensions/agent-browser/index.js");
+			expect(await checkBrowserAvailable(prefix)).toEqual({ installed: true, version: "9.8.7" });
+
+			const facade = createFacade();
+			void runRpcModeWithFacade(facade);
+			await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+			rpcIo.lineHandler!(JSON.stringify({ id: "ext-path", type: "get_extensions" }));
+			await vi.waitFor(() => {
+				const data = parseOutputLines().find((r) => r.id === "ext-path")?.data as
+					| { extensions: Array<{ id: string; installed: boolean }> }
+					| undefined;
+				expect(data?.extensions.find((e) => e.id === "agent-browser")?.installed).toBe(true);
+			});
+			expect(execCommand).not.toHaveBeenCalled();
+
+			// Not executable → not installed.
+			chmodSync(native, 0o644);
+			expect(await checkBrowserAvailable(prefix)).toEqual({ installed: false });
+			facade.dispose();
+		},
+	);
+
 	it("set_extension_enabled toggles a built-in extension and reports reload", async () => {
 		const facade = createFacade();
 		void runRpcModeWithFacade(facade);
@@ -700,6 +952,42 @@ describe("runRpcModeWithFacade", () => {
 			);
 		});
 		expect(facade.settingsManager.getDisabledBuiltinExtensions().has("agent-browser")).toBe(true);
+
+		facade.dispose();
+	});
+
+	it("set_extension_enabled toggles an installed plugin package by its source", async () => {
+		const facade = createFacade();
+		const packageManager = new DefaultPackageManager({
+			cwd: makeTempDir(),
+			agentDir: makeTempDir(),
+			settingsManager: facade.settingsManager,
+		});
+		packageManager.addSourceToSettings("npm:foo");
+		const resourceLoader = {
+			setConfiguredPackageEnabled: (source: string, enabled: boolean) =>
+				packageManager.setPackageEnabled(source, enabled),
+		} as unknown as ResourceLoader;
+		// SessionFacade fields are readonly config — rebuild with the loader.
+		Object.defineProperty(facade, "resourceLoader", { value: resourceLoader });
+		void runRpcModeWithFacade(facade);
+		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+
+		rpcIo.lineHandler!(
+			JSON.stringify({ id: "toggle-pkg", type: "set_extension_enabled", extensionId: "npm:foo", enabled: false }),
+		);
+		await vi.waitFor(() => {
+			expect(parseOutputLines()).toContainEqual(
+				expect.objectContaining({
+					id: "toggle-pkg",
+					type: "response",
+					command: "set_extension_enabled",
+					success: true,
+					data: { id: "npm:foo", enabled: false, requiresReload: true },
+				}),
+			);
+		});
+		expect(facade.settingsManager.extensions.get("npm:foo")?.enabled).toBe(false);
 
 		facade.dispose();
 	});
@@ -727,7 +1015,6 @@ describe("runRpcModeWithFacade", () => {
 	});
 
 	it("install_extension installs agent-browser and reports installed=true", async () => {
-		execMock.reset(false);
 		const facade = createFacade();
 		void runRpcModeWithFacade(facade);
 		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
@@ -751,7 +1038,6 @@ describe("runRpcModeWithFacade", () => {
 	});
 
 	it("uninstall_extension reports installed=false", async () => {
-		execMock.reset(false);
 		const facade = createFacade();
 		void runRpcModeWithFacade(facade);
 		await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());

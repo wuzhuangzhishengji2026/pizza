@@ -13,11 +13,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// Read an API key for a provider from ~/.pizza/agent/auth.json.
 fn read_api_key(provider: &str) -> Option<String> {
-	let home = std::env::var("HOME").ok()?;
-	let auth_path = PathBuf::from(&home)
-		.join(".pizza")
-		.join("agent")
-		.join("auth.json");
+	let auth_path = home_dir()?.join(".pizza").join("agent").join("auth.json");
 	let raw = std::fs::read_to_string(&auth_path).ok()?;
 	let parsed: Value = serde_json::from_str(&raw).ok()?;
 	let key = parsed.get(provider)?.get("key")?.as_str()?.to_string();
@@ -28,24 +24,30 @@ fn read_api_key(provider: &str) -> Option<String> {
 	}
 }
 
-const BRIDGE_LOG_PATH: &str = "/tmp/pizza-gui-bridge.log";
+/// Bridge log lives in the OS temp dir — /tmp does not exist on Windows.
+fn bridge_log_path() -> &'static PathBuf {
+	static CACHED: OnceLock<PathBuf> = OnceLock::new();
+	CACHED.get_or_init(|| std::env::temp_dir().join("pizza-gui-bridge.log"))
+}
+
 /// Rotate the bridge log once it exceeds ~10MB so it can't grow unbounded
 /// (get_state polling + per-rpc_response logging writes a lot).
 const BRIDGE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 pub(crate) fn log_file(msg: &str) {
 	use std::io::Write;
+	let log_path = bridge_log_path();
 	// Best-effort rotation: if the log is too big, move it aside and start fresh.
 	// Errors here are non-fatal — we still want the line written.
-	if let Ok(meta) = std::fs::metadata(BRIDGE_LOG_PATH) {
+	if let Ok(meta) = std::fs::metadata(log_path) {
 		if meta.len() > BRIDGE_LOG_MAX_BYTES {
-			let _ = std::fs::rename(BRIDGE_LOG_PATH, format!("{BRIDGE_LOG_PATH}.old"));
+			let _ = std::fs::rename(log_path, log_path.with_extension("log.old"));
 		}
 	}
 	if let Ok(mut f) = std::fs::OpenOptions::new()
 		.create(true)
 		.append(true)
-		.open(BRIDGE_LOG_PATH)
+		.open(log_path)
 	{
 		let _ = writeln!(f, "{}", msg);
 	}
@@ -59,8 +61,8 @@ fn find_node() -> Option<String> {
 		}
 	}
 	// Try nvm first — nvm versions are usually newer and have node:sqlite.
-	if let Ok(home) = std::env::var("HOME") {
-		let nvm_node = format!("{}/.nvm/versions/node", home);
+	if let Some(home) = home_dir() {
+		let nvm_node = home.join(".nvm").join("versions").join("node");
 		if let Ok(entries) = std::fs::read_dir(&nvm_node) {
 			let mut versions: Vec<_> = entries.filter_map(|e| e.ok()).collect();
 			versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
@@ -230,6 +232,17 @@ fn resolve_pizza_command(app: &AppHandle) -> (String, Vec<String>) {
 	)
 }
 
+/// The gateway daemon runs the same executable as the sidecar, minus the
+/// sidecar's `--mode rpc` (ensure_gateway appends `--mode gateway`). Leaving
+/// it in produced `pizza --mode rpc --mode gateway`, which only worked
+/// because the last `--mode` happens to win.
+fn gateway_command((program, mut args): (String, Vec<String>)) -> (String, Vec<String>) {
+	if args.ends_with(&["--mode".to_string(), "rpc".to_string()]) {
+		args.truncate(args.len() - 2);
+	}
+	(program, args)
+}
+
 /// Sidecar entry: the process + which windows are using it.
 struct SidecarEntry {
 	child: Child,
@@ -261,6 +274,11 @@ pub struct BridgeState {
 	restarting: Mutex<HashSet<String>>,
 	/// Active OAuth login child (`pizza auth login --mode jsonl`), if any.
 	oauth_login: Mutex<Option<OAuthLoginChild>>,
+	/// Cached `pizza auth list --json` result. The option list only changes
+	/// when the pizza binary is upgraded, so it is warmed at app startup and
+	/// kept for the session — spawning the CLI for every Settings open takes
+	/// >1s and made the "Sign in with an account" section visibly delayed.
+	auth_options_cache: Mutex<Option<Vec<AuthLoginOption>>>,
 }
 
 /// A running `pizza auth login --mode jsonl` child plus its stdin writer.
@@ -277,6 +295,7 @@ impl Default for BridgeState {
 			active: Mutex::new(HashMap::new()),
 			restarting: Mutex::new(HashSet::new()),
 			oauth_login: Mutex::new(None),
+			auth_options_cache: Mutex::new(None),
 		}
 	}
 }
@@ -301,21 +320,33 @@ pub fn kill_sidecar_for_cwd(state: &BridgeState, cwd: &str) {
 	}
 }
 
+/// Drop every gateway channel and kill every legacy sidecar — used right
+/// before an update replaces the app bundle.
+pub fn shutdown_all_agents(state: &BridgeState) {
+	for (_, channel) in lock_ok(&state.channels).drain() {
+		channel.close();
+	}
+	let cwds: Vec<String> = lock_ok(&state.sidecars).keys().cloned().collect();
+	for cwd in cwds {
+		kill_sidecar_for_cwd(state, &cwd);
+	}
+}
+
 /// Kill all sidecars for a given window (by active cwd).
 pub fn kill_sidecar_for_window(state: &BridgeState, window_label: &str) {
 	let cwd = {
-		let active = state.active.lock().unwrap();
+		let active = lock_ok(&state.active);
 		active.get(window_label).cloned()
 	};
 	if let Some(cwd) = cwd {
 		// Remove this window from active map.
 		{
-			let mut active = state.active.lock().unwrap();
+			let mut active = lock_ok(&state.active);
 			active.remove(window_label);
 		}
 		// Check if any other window is using this sidecar.
 		let still_in_use = {
-			let active = state.active.lock().unwrap();
+			let active = lock_ok(&state.active);
 			active.values().any(|c| c == &cwd)
 		};
 		if !still_in_use {
@@ -381,10 +412,7 @@ fn broadcast_to_all_sidecars(state: &BridgeState, command_type: &str) {
 /// the result is ignored — this is best-effort fan-out (e.g. reload_providers
 /// after editing auth.json).
 async fn broadcast_to_all_channels(state: &BridgeState, command_type: &str) {
-	let entries: Vec<(String, gateway_channel::GatewayChannel)> = state
-		.channels
-		.lock()
-		.unwrap()
+	let entries: Vec<(String, gateway_channel::GatewayChannel)> = lock_ok(&state.channels)
 		.iter()
 		.map(|(k, v)| (k.clone(), v.clone()))
 		.collect();
@@ -407,14 +435,44 @@ async fn broadcast_to_all_channels(state: &BridgeState, command_type: &str) {
 }
 
 fn home_dir() -> Option<PathBuf> {
-	std::env::var("HOME").ok().map(PathBuf::from)
+	// Windows sets USERPROFILE, not HOME — fall back so ~/.pizza paths
+	// resolve on every platform.
+	std::env::var("HOME")
+		.or_else(|_| std::env::var("USERPROFILE"))
+		.ok()
+		.map(PathBuf::from)
+		.filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Expand a leading `~` to the user's home directory. Other `~` positions
+/// (and `~user` forms) are left untouched.
+fn expand_tilde(path: &str) -> String {
+	if !path.starts_with("~") {
+		return path.to_string();
+	}
+	match home_dir() {
+		Some(home) => {
+			let rest = path[1..].trim_start_matches(['/', '\\']);
+			if rest.is_empty() {
+				home.to_string_lossy().to_string()
+			} else {
+				home.join(rest).to_string_lossy().to_string()
+			}
+		}
+		None => path.to_string(),
+	}
 }
 
 fn normalize_path_for_compare(path: &str) -> String {
-	std::fs::canonicalize(path)
+	let normalized = std::fs::canonicalize(path)
 		.unwrap_or_else(|_| PathBuf::from(path))
 		.to_string_lossy()
-		.replace('\\', "/")
+		.replace('\\', "/");
+	if cfg!(windows) {
+		normalized.to_lowercase()
+	} else {
+		normalized
+	}
 }
 
 fn persistent_chat_cwd() -> Option<String> {
@@ -452,16 +510,30 @@ fn is_process_alive(pid: u32) -> bool {
 		.unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
-	let pid_arg = pid.to_string();
-	Command::new("ps")
-		.args(["-p", &pid_arg])
-		.status()
-		.map(|status| status.success())
+	// `tasklist /FI "PID eq <pid>" /FO CSV /NH` prints one CSV line per
+	// matching process, or "INFO: No tasks..." when the pid is dead.
+	Command::new("tasklist")
+		.args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+		.output()
+		.map(|out| {
+			String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+				line.split(',')
+					.nth(1)
+					.map(|field| field.trim_matches('"') == pid.to_string())
+					.unwrap_or(false)
+			})
+		})
 		.unwrap_or(false)
 }
 
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+	false
+}
+
+#[cfg(unix)]
 fn process_command(pid: u32) -> Option<String> {
 	let pid_arg = pid.to_string();
 	let output = Command::new("ps")
@@ -477,6 +549,35 @@ fn process_command(pid: u32) -> Option<String> {
 	} else {
 		Some(command)
 	}
+}
+
+#[cfg(windows)]
+fn process_command(pid: u32) -> Option<String> {
+	let output = Command::new("powershell")
+		.args([
+			"-NoProfile",
+			"-Command",
+			&format!(
+				"(Get-CimInstance Win32_Process -Filter 'ProcessId={}').CommandLine",
+				pid
+			),
+		])
+		.output()
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+	if command.is_empty() {
+		None
+	} else {
+		Some(command)
+	}
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_command(_pid: u32) -> Option<String> {
+	None
 }
 
 fn is_probably_pizza_main_agent(command: &str) -> bool {
@@ -527,7 +628,7 @@ pub async fn stop_main_agent() -> Result<MainAgentStatus, String> {
 	let command = process_command(pid).unwrap_or_default();
 	if !is_probably_pizza_main_agent(&command) {
 		return Err(format!(
-			"锁文件指向的进程不像 Pizza 主助手，已停止自动处理。PID: {}，命令: {}",
+			"The process referenced by the lock file does not look like the Pizza main agent; aborting. PID: {}, command: {}",
 			pid,
 			if command.is_empty() {
 				"<unknown>"
@@ -546,13 +647,18 @@ pub async fn stop_main_agent() -> Result<MainAgentStatus, String> {
 
 	#[cfg(not(unix))]
 	let stop_result = Command::new("taskkill")
-		.args(["/PID", &pid.to_string(), "/T"])
+		// /F is required — the pizza sidecar is a console-less child process
+		// and ignores the graceful WM_CLOSE that plain taskkill sends.
+		.args(["/PID", &pid.to_string(), "/T", "/F"])
 		.status()
 		.map(|status| status.success())
 		.unwrap_or(false);
 
 	if !stop_result {
-		return Err(format!("无法停止旧主助手进程 PID {}", pid));
+		return Err(format!(
+			"Failed to stop the old main agent process (PID {})",
+			pid
+		));
 	}
 
 	for _ in 0..30 {
@@ -569,7 +675,7 @@ pub async fn stop_main_agent() -> Result<MainAgentStatus, String> {
 	}
 
 	Err(format!(
-		"已请求旧主助手退出，但进程 PID {} 仍在运行。请先手动关闭旧 Pizza 窗口后重试。",
+		"Asked the old main agent to exit, but PID {} is still running. Close the old Pizza window manually and try again.",
 		pid
 	))
 }
@@ -732,6 +838,9 @@ fn spawn_background_sidecar(
 	state: &BridgeState,
 	cwd: String,
 ) -> Result<(), String> {
+	if crate::updater::is_installing() {
+		return Err("Pizza is installing an update".into());
+	}
 	if !std::path::Path::new(&cwd).is_dir() {
 		return Err(format!("Directory does not exist: {}", cwd));
 	}
@@ -813,7 +922,7 @@ fn spawn_background_sidecar(
 					log_file(&format!("sidecar stdout [cwd={}]: {}", reader_cwd, trimmed));
 					let app_ref = &app;
 					let active = app_ref.state::<BridgeState>();
-					let active_map = active.active.lock().unwrap();
+					let active_map = lock_ok(&active.active);
 					let etype = parsed
 						.get("type")
 						.and_then(|t| t.as_str())
@@ -923,6 +1032,9 @@ pub async fn init_sidecar(
 ) -> Result<String, String> {
 	let window_label = window.label().to_string();
 	log_file(&format!("init_sidecar: start, window={}", window_label));
+	if crate::updater::is_installing() {
+		return Err("Pizza is installing an update and will restart shortly".into());
+	}
 
 	let cwd = cwd.unwrap_or_else(|| {
 		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -933,25 +1045,14 @@ pub async fn init_sidecar(
 			.unwrap_or_else(|_| ".".to_string())
 	});
 	// Expand ~ to home directory.
-	let cwd = if cwd.starts_with("~") {
-		if let Ok(home) = std::env::var("HOME") {
-			format!("{}{}", home, &cwd[1..])
-		} else {
-			cwd
-		}
-	} else {
-		cwd
-	};
+	let cwd = expand_tilde(&cwd);
 	log_file(&format!("init_sidecar: cwd={}", cwd));
 
 	// The persistent Chat workspace (~/.pizza/main) is auto-created on first
 	// launch. It is the default workspace the desktop app boots into, so it
 	// must always exist — unlike user-selected project directories, which are
 	// expected to be present already.
-	let is_persistent_chat = std::env::var("HOME")
-		.ok()
-		.map(|home| cwd == format!("{}/.pizza/main", home))
-		.unwrap_or(false);
+	let is_persistent_chat = is_persistent_chat_cwd(&cwd);
 	if is_persistent_chat && !std::path::Path::new(&cwd).is_dir() {
 		log_file(&format!(
 			"init_sidecar: creating persistent Chat workspace at {}",
@@ -987,7 +1088,7 @@ pub async fn init_sidecar(
 			cwd
 		));
 		{
-			let mut active = state.active.lock().unwrap();
+			let mut active = lock_ok(&state.active);
 			active.insert(window_label.clone(), cwd.clone());
 		}
 		// Send get_state to get current state.
@@ -1168,7 +1269,7 @@ pub async fn init_sidecar(
 
 	// Set active cwd for this window.
 	{
-		let mut active = state.active.lock().unwrap();
+		let mut active = lock_ok(&state.active);
 		active.insert(window_label.clone(), cwd.clone());
 	}
 
@@ -1192,7 +1293,7 @@ pub async fn init_sidecar(
 					// Emit to all windows that have this cwd as active.
 					let app_ref = &app;
 					let active = app_ref.state::<BridgeState>();
-					let active_map = active.active.lock().unwrap();
+					let active_map = lock_ok(&active.active);
 					// Emit to ALL windows — include _cwd so frontend can filter.
 					// This ensures events are received even when the workspace is not active.
 					let etype = parsed
@@ -1271,7 +1372,7 @@ pub async fn init_sidecar(
 		let state_ref = app_ref.state::<BridgeState>();
 		let suppress = state_ref.restarting.lock().unwrap().contains(&reader_cwd);
 		let active = state_ref;
-		let active_map = active.active.lock().unwrap();
+		let active_map = lock_ok(&active.active);
 		if !suppress {
 			for (label, _ac_cwd) in active_map.iter() {
 				if let Some(win) = app_ref.get_webview_window(label) {
@@ -1372,36 +1473,31 @@ pub async fn rpc_command(
 
 	// Route to the active sidecar for this window.
 	let cwd = {
-		let active = state.active.lock().unwrap();
+		let active = lock_ok(&state.active);
 		active.get(window_label).cloned()
 	};
 	let cwd = cwd.ok_or("No active workspace for this window")?;
 
 	// Gateway-mode: forward via the channel instead of the sidecar stdin.
-	// channel.rpc() blocks until the response arrives (up to 60s). Run it on
+	// channel.rpc() blocks until the response arrives (up to 60s). gateway_rpc runs it on
 	// a blocking thread so we don't freeze the Tauri main thread / webview
 	// event loop — the frontend needs the main thread free to receive the
 	// rpc_response event we emit after the call returns.
-	let channel_opt = state.channels.lock().unwrap().get(&cwd).cloned();
+	let channel_opt = lock_ok(&state.channels).get(&cwd).cloned();
 	if let Some(channel) = channel_opt {
-		let cwd_for_blocking = cwd.clone();
 		let cmd_type_for_log = obj
 			.get("type")
 			.and_then(|t| t.as_str())
 			.unwrap_or("")
 			.to_string();
 		let frame = Value::Object(obj);
-		let resp =
-			tauri::async_runtime::spawn_blocking(move || channel.rpc(&cwd_for_blocking, frame))
-				.await
-				.map_err(|e| format!("blocking task failed: {e}"))?
-				.map_err(|e| {
-					log_file(&format!(
-						"rpc_command [{}] gateway rpc FAILED: type={} error={}",
-						window_label, cmd_type_for_log, e
-					));
-					e
-				})?;
+		let resp = gateway_rpc(&channel, &cwd, frame).await.map_err(|e| {
+			log_file(&format!(
+				"rpc_command [{}] gateway rpc FAILED: type={} error={}",
+				window_label, cmd_type_for_log, e
+			));
+			e
+		})?;
 		log_file(&format!(
 			"rpc_command [{}] gateway rpc OK: type={}",
 			window_label, cmd_type_for_log
@@ -1427,6 +1523,50 @@ pub async fn rpc_command(
 	Ok(id)
 }
 
+/// Channel-management ops (list/save/delete/set_enabled/test) — gateway-level
+/// requests that aren't tied to any one workspace. They reuse whatever live
+/// gateway channel exists (the window's active one, else any), falling back to
+/// a one-shot connection when nothing is attached yet (e.g. Plugins tab open
+/// before any workspace).
+#[tauri::command]
+pub async fn channel_op(
+	window: tauri::Window,
+	app: AppHandle,
+	state: tauri::State<'_, BridgeState>,
+	request: Value,
+) -> Result<Value, String> {
+	let channel = {
+		let cwd = lock_ok(&state.active).get(window.label()).cloned();
+		let channels = lock_ok(&state.channels);
+		cwd.and_then(|c| channels.get(&c).cloned())
+			.or_else(|| channels.values().next().cloned())
+	};
+	if let Some(channel) = channel {
+		let ch = channel.clone();
+		return match tauri::async_runtime::spawn_blocking(move || ch.channel_op(request)).await {
+			Ok(result) => result,
+			Err(join_err) => Err(format!("blocking task failed: {join_err}")),
+		};
+	}
+	// No channel connection exists yet: open a transient one for this op.
+	let socket = gateway_channel::gateway_socket_path()
+		.ok_or_else(|| "HOME not set; cannot resolve gateway socket".to_string())?;
+	let (program, args) = gateway_command(resolve_pizza_command(&app));
+	tauri::async_runtime::spawn_blocking(move || {
+		gateway_channel::ensure_gateway(
+			&socket,
+			(&program, &args),
+			Some(env!("CARGO_PKG_VERSION")),
+		)?;
+		let channel = gateway_channel::GatewayChannel::connect(&socket)?;
+		let result = channel.channel_op(request);
+		channel.close();
+		result
+	})
+	.await
+	.map_err(|e| format!("blocking task failed: {e}"))?
+}
+
 /// True when the desktop should route workspaces through the gateway broker
 /// instead of spawning per-cwd sidecars. Gateway mode is the default — it
 /// keeps agent processes alive across desktop restarts and lets multiple
@@ -1436,6 +1576,55 @@ fn gateway_mode_enabled() -> bool {
 	std::env::var("PIZZA_DESKTOP_GATEWAY")
 		.map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
 		.unwrap_or(true)
+}
+
+/// Async-side ceiling for one gateway rpc. `GatewayChannel` bounds its own
+/// I/O (write timeout + 60s response deadline that also covers the write), so
+/// this only fires if the blocking task itself never completes — a backstop
+/// guaranteeing the Tauri invoke always settles.
+const GATEWAY_RPC_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(70);
+
+/// Run `channel.rpc` on the blocking pool under `GATEWAY_RPC_WATCHDOG`. If
+/// the watchdog fires the connection is closed: its reader exits, pending
+/// waiters are released and the drainer's disconnect path evicts it, so the
+/// next init/retry builds a fresh connection instead of reusing a wedged one.
+async fn gateway_rpc(
+	channel: &gateway_channel::GatewayChannel,
+	cwd: &str,
+	frame: Value,
+) -> Result<Value, String> {
+	let ch = channel.clone();
+	let cwd_owned = cwd.to_string();
+	match tokio::time::timeout(
+		GATEWAY_RPC_WATCHDOG,
+		tauri::async_runtime::spawn_blocking(move || ch.rpc(&cwd_owned, frame)),
+	)
+	.await
+	{
+		Ok(Ok(result)) => result,
+		Ok(Err(join_err)) => Err(format!("blocking task failed: {join_err}")),
+		Err(_elapsed) => {
+			channel.close();
+			Err(format!(
+				"gateway rpc timed out after {}s; the connection was reset",
+				GATEWAY_RPC_WATCHDOG.as_secs()
+			))
+		}
+	}
+}
+
+/// Lock a BridgeState mutex, recovering from poisoning instead of panicking.
+/// A panic elsewhere while holding the lock must not wedge every subsequent
+/// command: a poisoned `Mutex` unwraps to a panic inside the async command,
+/// which leaves the frontend invoke unsettled forever (observed on Windows as
+/// an eternal "starting…" splash). The protected data are simple maps whose
+/// invariants do not depend on lock handoff, so the poisoned data is still
+/// usable.
+fn lock_ok<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+	match m.lock() {
+		Ok(guard) => guard,
+		Err(poisoned) => poisoned.into_inner(),
+	}
 }
 
 /// Emit one parsed Layer-0 frame to every window, tagged with `_cwd`, mirroring
@@ -1453,8 +1642,12 @@ fn emit_frame_to_windows(app: &AppHandle, cwd: &str, mut parsed: Value) {
 		}
 	}
 	let state = app.state::<BridgeState>();
-	let active_map = state.active.lock().unwrap();
-	for (label, _ac_cwd) in active_map.iter() {
+	// Snapshot the window labels and drop the lock BEFORE any webview emit:
+	// `win.emit` is synchronous cross-process IPC — holding `active` across it
+	// serializes every other command that needs the map and can deadlock with
+	// a busy webview (observed on Windows as an eternal "starting…" splash).
+	let labels: Vec<String> = lock_ok(&state.active).keys().cloned().collect();
+	for label in &labels {
 		if let Some(win) = app.get_webview_window(label) {
 			match etype.as_str() {
 				"response" => {
@@ -1492,13 +1685,24 @@ async fn init_sidecar_via_gateway(
 	log_file(&format!("init_sidecar_via_gateway: cwd={}", cwd));
 	// Already attached? Just switch the active pointer and re-fetch state.
 	// Extract the channel first, then drop all locks before awaiting.
-	let existing_channel = state.channels.lock().unwrap().get(&cwd).cloned();
+	// A dead connection (closed by a failed write / watchdog) is dropped here
+	// so we reconnect below rather than failing every command on it.
+	let existing_channel = {
+		let mut channels = lock_ok(&state.channels);
+		match channels.get(&cwd) {
+			Some(ch) if !ch.is_alive() => {
+				log_file(&format!(
+					"init_sidecar_via_gateway: dropping dead channel cwd={}",
+					cwd
+				));
+				channels.remove(&cwd);
+				None
+			}
+			other => other.cloned(),
+		}
+	};
 	if let Some(ch) = existing_channel {
-		state
-			.active
-			.lock()
-			.unwrap()
-			.insert(window_label, cwd.clone());
+		lock_ok(&state.active).insert(window_label, cwd.clone());
 		// Re-attach: the gateway may have idle-evicted the agent and cleared
 		// subscribers[cwd] during teardown. Without re-attaching, event fan-out
 		// silently drops because our subscriber is gone. attach is idempotent
@@ -1509,11 +1713,7 @@ async fn init_sidecar_via_gateway(
 			.await;
 		let frame =
 			serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "type": "get_state" });
-		let cwd_for_blocking = cwd.clone();
-		let resp_result =
-			tauri::async_runtime::spawn_blocking(move || ch.rpc(&cwd_for_blocking, frame))
-				.await
-				.map_err(|e| format!("blocking task failed: {e}"))?;
+		let resp_result = gateway_rpc(&ch, &cwd, frame).await;
 		// Return the actual state JSON so callers (especially restart_sidecar)
 		// get a real payload instead of {}. In gateway mode restart_sidecar
 		// can't respawn the agent process, so this re-fetched state — which
@@ -1537,54 +1737,61 @@ async fn init_sidecar_via_gateway(
 
 	let socket = gateway_channel::gateway_socket_path()
 		.ok_or_else(|| "HOME not set; cannot resolve gateway socket".to_string())?;
-	let (program, args) = resolve_pizza_command(&app);
-	let socket_for_blocking = socket.clone();
-	let program_for_blocking = program.clone();
-	let args_for_blocking = args.clone();
-	tauri::async_runtime::spawn_blocking(move || {
+	let (program, args) = gateway_command(resolve_pizza_command(&app));
+	let cwd_for_blocking = cwd.clone();
+	// ensure_gateway, connect and attach all block (attach waits up to 15s
+	// for attach_ok): keep them off the async runtime's worker threads.
+	let (channel, resolved_cwd) = tauri::async_runtime::spawn_blocking(move || {
 		gateway_channel::ensure_gateway(
-			&socket_for_blocking,
-			(&program_for_blocking, &args_for_blocking),
+			&socket,
+			(&program, &args),
 			Some(env!("CARGO_PKG_VERSION")),
-		)
+		)?;
+		let channel = gateway_channel::GatewayChannel::connect(&socket)?;
+		match channel.attach(&cwd_for_blocking) {
+			Ok(resolved) => Ok((channel, resolved)),
+			Err(e) => {
+				channel.close();
+				Err(e)
+			}
+		}
 	})
 	.await
 	.map_err(|e| format!("blocking task failed: {e}"))??;
-
-	let channel = gateway_channel::GatewayChannel::connect(&socket)?;
-	let resolved_cwd = channel.attach(&cwd)?;
 	log_file(&format!(
 		"init_sidecar_via_gateway: attached resolved={}",
 		resolved_cwd
 	));
 
 	// Initial state via the channel, emitted as rpc_response for the frontend.
-	let id = uuid::Uuid::new_v4().to_string();
-	let state_frame = serde_json::json!({ "id": id, "type": "get_state" });
-	let cwd_for_state = cwd.clone();
-	let channel_for_state = channel.clone();
-	let state_resp = tauri::async_runtime::spawn_blocking(move || {
-		channel_for_state.rpc(&cwd_for_state, state_frame)
-	})
-	.await
-	.map_err(|e| format!("blocking task failed: {e}"))?
-	.map_err(|e| e.to_string())?;
+	// On failure the unregistered channel is closed so it doesn't linger as
+	// a zombie subscriber on the gateway; a retry builds a fresh connection.
+	let state_frame =
+		serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "type": "get_state" });
+	log_file(&format!(
+		"init_sidecar_via_gateway: sending get_state cwd={}",
+		cwd
+	));
+	let state_resp = gateway_rpc(&channel, &cwd, state_frame)
+		.await
+		.map_err(|e| {
+			log_file(&format!(
+				"init_sidecar_via_gateway: get_state failed cwd={}: {}",
+				cwd, e
+			));
+			channel.close();
+			format!("{e}. Click retry, or set PIZZA_DESKTOP_GATEWAY=0 to use direct sidecar mode.")
+		})?;
+	log_file("init_sidecar_via_gateway: get_state ok, registering channel");
 	emit_frame_to_windows(&app, &resolved_cwd, state_resp);
 
-	state
-		.channels
-		.lock()
-		.unwrap()
-		.insert(cwd.clone(), channel.clone());
-	state
-		.active
-		.lock()
-		.unwrap()
-		.insert(window_label, cwd.clone());
+	lock_ok(&state.channels).insert(cwd.clone(), channel.clone());
+	lock_ok(&state.active).insert(window_label, cwd.clone());
 
 	// Drain fanned-out events → windows. Exits when the channel disconnects.
 	let app_for_drain = app.clone();
 	let drain_cwd = resolved_cwd.clone();
+	let channel_key = cwd.clone();
 	std::thread::spawn(move || {
 		loop {
 			let messages = channel.drain_events();
@@ -1599,18 +1806,18 @@ async fn init_sidecar_via_gateway(
 			if disconnected {
 				log_file(&format!("gateway channel disconnected cwd={}", drain_cwd));
 				// Drop the stale channel so a fresh attach can take its place.
+				// It's keyed by the requested cwd (not the resolved one), and
+				// a re-init may already have replaced it with a live channel.
 				{
 					let state = app_for_drain.state::<BridgeState>();
-					state.channels.lock().unwrap().remove(&drain_cwd);
+					let mut channels = lock_ok(&state.channels);
+					if channels.get(&channel_key).is_some_and(|c| !c.is_alive()) {
+						channels.remove(&channel_key);
+					}
 				}
 				// Notify the frontend exactly like a sidecar exit would, so its
 				// reconnect/restart logic kicks in (it listens on "sidecar_exit").
-				let active = app_for_drain
-					.state::<BridgeState>()
-					.active
-					.lock()
-					.unwrap()
-					.clone();
+				let active = lock_ok(&app_for_drain.state::<BridgeState>().active).clone();
 				for (label, _ac_cwd) in active.iter() {
 					if let Some(win) = app_for_drain.get_webview_window(label) {
 						let _ = win.emit(
@@ -1657,11 +1864,7 @@ pub async fn new_workspace(app: AppHandle) -> Result<String, String> {
 /// List all workspaces from ~/.pizza/agent/workspaces/*/meta.json
 #[tauri::command]
 pub async fn list_workspaces() -> Result<Vec<Value>, String> {
-	let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-	let workspaces_dir = PathBuf::from(&home)
-		.join(".pizza")
-		.join("agent")
-		.join("workspaces");
+	let workspaces_dir = workspace_meta_root().ok_or("could not determine home directory")?;
 
 	if !workspaces_dir.exists() {
 		return Ok(Vec::new());
@@ -1723,11 +1926,8 @@ pub async fn delete_workspace(
 	state: tauri::State<'_, BridgeState>,
 	workspace_id: String,
 ) -> Result<(), String> {
-	let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-	let ws_dir = PathBuf::from(&home)
-		.join(".pizza")
-		.join("agent")
-		.join("workspaces")
+	let ws_dir = workspace_meta_root()
+		.ok_or("could not determine home directory")?
 		.join(&workspace_id);
 
 	if !ws_dir.exists() {
@@ -1770,15 +1970,7 @@ pub async fn delete_workspace(
 /// and the frontend surfaces them as <file path="..."/> references.
 #[tauri::command]
 pub async fn reveal_file(absolute_path: String) -> Result<(), String> {
-	let path = if absolute_path.starts_with("~") {
-		if let Ok(home) = std::env::var("HOME") {
-			format!("{}{}", home, &absolute_path[1..])
-		} else {
-			absolute_path.clone()
-		}
-	} else {
-		absolute_path.clone()
-	};
+	let path = expand_tilde(&absolute_path);
 
 	if !std::path::Path::new(&path).exists() {
 		return Err(format!("Path does not exist: {}", path));
@@ -1899,7 +2091,7 @@ pub async fn save_upload(
 ) -> Result<FileAttachmentInfo, String> {
 	let window_label = window.label().to_string();
 	let cwd = {
-		let active = state.active.lock().unwrap();
+		let active = lock_ok(&state.active);
 		active
 			.get(&window_label)
 			.cloned()
@@ -1932,15 +2124,7 @@ pub async fn save_upload(
 /// Reveal a workspace's cwd in the system file manager (Finder on macOS).
 #[tauri::command]
 pub async fn reveal_workspace(cwd: String) -> Result<(), String> {
-	let path = if cwd.starts_with("~") {
-		if let Ok(home) = std::env::var("HOME") {
-			format!("{}{}", home, &cwd[1..])
-		} else {
-			cwd.clone()
-		}
-	} else {
-		cwd.clone()
-	};
+	let path = expand_tilde(&cwd);
 
 	if !std::path::Path::new(&path).exists() {
 		return Err(format!("Path does not exist: {}", path));
@@ -2003,8 +2187,9 @@ pub struct CustomProviderTestResult {
 }
 
 fn agent_dir() -> Result<PathBuf, String> {
-	let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-	Ok(PathBuf::from(&home).join(".pizza").join("agent"))
+	home_dir()
+		.map(|home| home.join(".pizza").join("agent"))
+		.ok_or_else(|| "could not determine home directory".to_string())
 }
 
 fn auth_path() -> Result<PathBuf, String> {
@@ -2701,13 +2886,15 @@ pub async fn transcribe_audio(audio_b64: String, mime_type: String) -> Result<St
 /// Uses `/usr/bin/which` on macOS (since `which` is a shell built-in)
 /// and `which` on other platforms.
 fn which(cmd: &str) -> bool {
+	#[cfg(target_os = "windows")]
+	let (which_bin, args) = ("where", vec![cmd]);
 	#[cfg(target_os = "macos")]
-	let which_bin = "/usr/bin/which";
-	#[cfg(not(target_os = "macos"))]
-	let which_bin = "which";
+	let (which_bin, args) = ("/usr/bin/which", vec![cmd]);
+	#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+	let (which_bin, args) = ("which", vec![cmd]);
 
 	std::process::Command::new(which_bin)
-		.arg(cmd)
+		.args(args)
 		.stdout(std::process::Stdio::null())
 		.stderr(std::process::Stdio::null())
 		.status()
@@ -2860,12 +3047,7 @@ pub struct DirEntry {
 
 /// Resolve `cwd` (expanding `~`) and join `sub_path` if provided.
 fn resolve_workspace_path(cwd: &str, sub_path: Option<&str>) -> Result<PathBuf, String> {
-	let expanded = if cwd.starts_with("~") {
-		let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-		format!("{}{}", home, &cwd[1..])
-	} else {
-		cwd.to_string()
-	};
+	let expanded = expand_tilde(cwd);
 	let base = PathBuf::from(&expanded);
 	let full = match sub_path {
 		Some(s) if !s.is_empty() => base.join(s),
@@ -3546,9 +3728,69 @@ pub async fn fetch_skills_sh() -> Result<String, String> {
 	Ok(html)
 }
 
+/// Fetch a pi.dev packages catalog page via Rust (bypasses CORS).
+/// `query` is the raw query string (e.g. "type=extension&sort=downloads&page=1").
+#[tauri::command]
+pub async fn fetch_pi_packages(query: String) -> Result<String, String> {
+	let client = reqwest::Client::builder()
+		.user_agent("pizza-desktop/0.1")
+		.timeout(Duration::from_secs(15))
+		.build()
+		.map_err(|e| format!("HTTP client error: {e}"))?;
+
+	let res = client
+		.get(format!("https://pi.dev/packages?{query}"))
+		.send()
+		.await
+		.map_err(|e| format!("Fetch error: {e}"))?;
+
+	if !res.status().is_success() {
+		return Err(format!("pi.dev returned status {}", res.status()));
+	}
+
+	let html = res
+		.text()
+		.await
+		.map_err(|e| format!("Read body error: {e}"))?;
+
+	Ok(html)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn normalizes_windows_paths_for_comparison() {
+		let normalized = normalize_path_for_compare(r"C:\Users\Tom\.pizza\main");
+		if cfg!(windows) {
+			assert_eq!(normalized, "c:/users/tom/.pizza/main");
+		} else {
+			assert_eq!(normalized, "C:/Users/Tom/.pizza/main");
+		}
+	}
+
+	#[test]
+	fn gateway_command_strips_sidecar_mode() {
+		let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+		assert_eq!(
+			gateway_command(("pizza".into(), s(&["--mode", "rpc"]))),
+			("pizza".to_string(), vec![])
+		);
+		assert_eq!(
+			gateway_command((
+				"node".into(),
+				s(&["--loader", "l.mjs", "cli.js", "--mode", "rpc"])
+			))
+			.1,
+			s(&["--loader", "l.mjs", "cli.js"])
+		);
+		// Anything else is passed through untouched.
+		assert_eq!(
+			gateway_command(("pizza".into(), s(&["--verbose"]))).1,
+			s(&["--verbose"])
+		);
+	}
 
 	#[test]
 	fn resolve_shell_path_never_empty() {
@@ -3708,16 +3950,34 @@ pub async fn oauth_login(
 	std::thread::spawn(move || {
 		use std::io::BufRead;
 		let reader = std::io::BufReader::new(stdout);
+		let mut ok_done = false;
 		for line in reader.lines() {
 			let Ok(line) = line else { break };
 			let parsed: Option<serde_json::Value> = serde_json::from_str(&line).ok();
 			if let Some(value) = parsed {
 				let done = value.get("type").and_then(|t| t.as_str()) == Some("done");
+				if done && value.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+					ok_done = true;
+				}
 				let _ = app.emit("auth_login_event", value);
 				if done {
 					break;
 				}
 			}
+		}
+		// A successful login rewrote auth.json, which sidecars keep cached in
+		// memory — fan out reload_providers like set_provider_api_key does, or
+		// the new credential stays invisible until the next app restart.
+		if ok_done {
+			if let Some(state) = app.try_state::<BridgeState>() {
+				broadcast_to_all_sidecars(state.inner(), "reload_providers");
+			}
+			let channel_app = app.clone();
+			tauri::async_runtime::spawn(async move {
+				if let Some(state) = channel_app.try_state::<BridgeState>() {
+					broadcast_to_all_channels(state.inner(), "reload_providers").await;
+				}
+			});
 		}
 		// Ensure the child is reaped and the slot freed.
 		if let Some(state) = app.try_state::<BridgeState>() {
@@ -3768,10 +4028,8 @@ pub struct AuthLoginOption {
 	pub kind: String, // "account" | "apiKey"
 }
 
-/// `pizza auth list --json` — both login categories.
-#[tauri::command]
-pub async fn list_auth_options(app: AppHandle) -> Result<Vec<AuthLoginOption>, String> {
-	let (program, mut base_args) = resolve_pizza_command_binary(&app);
+fn run_auth_list(app: &AppHandle) -> Result<Vec<AuthLoginOption>, String> {
+	let (program, mut base_args) = resolve_pizza_command_binary(app);
 	base_args.retain(|a| a != "rpc" && a != "--mode");
 	let output = std::process::Command::new(&program)
 		.args(base_args)
@@ -3799,6 +4057,41 @@ pub async fn list_auth_options(app: AppHandle) -> Result<Vec<AuthLoginOption>, S
 		}
 	}
 	Ok(options)
+}
+
+/// `pizza auth list --json` — both login categories. Served from the
+/// session cache when warm (see `warm_auth_options`).
+#[tauri::command]
+pub async fn list_auth_options(
+	app: AppHandle,
+	state: tauri::State<'_, BridgeState>,
+) -> Result<Vec<AuthLoginOption>, String> {
+	if let Some(cached) = state.auth_options_cache.lock().unwrap().clone() {
+		return Ok(cached);
+	}
+	let options = run_auth_list(&app)?;
+	*state.auth_options_cache.lock().unwrap() = Some(options.clone());
+	Ok(options)
+}
+
+/// Warm the auth-options cache in the background at app startup so the first
+/// Settings open doesn't wait on a pizza CLI spawn.
+pub(crate) fn warm_auth_options(app: &AppHandle) {
+	if app
+		.state::<BridgeState>()
+		.auth_options_cache
+		.lock()
+		.unwrap()
+		.is_some()
+	{
+		return;
+	}
+	if let Ok(options) = run_auth_list(app) {
+		*app.state::<BridgeState>()
+			.auth_options_cache
+			.lock()
+			.unwrap() = Some(options);
+	}
 }
 
 // ─── App update check ───────────────────────────────────────────────────────
@@ -3897,8 +4190,8 @@ fn pick_platform_asset(asset_urls: &[String]) -> Option<String> {
 }
 
 const GITHUB_LATEST_RELEASE_API: &str =
-	"https://api.github.com/repos/tomsun28/pizza/releases/latest";
-const GITHUB_RELEASES_PAGE: &str = "https://github.com/tomsun28/pizza/releases/latest";
+	"https://api.github.com/repos/pizza-agent/pizza/releases/latest";
+const GITHUB_RELEASES_PAGE: &str = "https://github.com/pizza-agent/pizza/releases/latest";
 
 /// Check GitHub releases for a newer desktop app version. Never fails hard —
 /// network problems come back as `AppUpdateInfo.error` so the caller can

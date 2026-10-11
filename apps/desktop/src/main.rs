@@ -3,6 +3,7 @@
 
 mod bridge;
 mod gateway_channel;
+mod updater;
 
 use tauri::{DragDropEvent, Emitter, Manager, WindowEvent};
 
@@ -11,6 +12,7 @@ fn main() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_shell::init())
 		.plugin(tauri_plugin_dialog::init())
+		.plugin(tauri_plugin_updater::Builder::new().build())
 		.manage(bridge::BridgeState::default())
 		.invoke_handler(tauri::generate_handler![
 			bridge::init_sidecar,
@@ -18,6 +20,7 @@ fn main() {
 			bridge::stop_main_agent,
 			bridge::stop_sidecar,
 			bridge::rpc_command,
+			bridge::channel_op,
 			bridge::new_workspace,
 			bridge::list_workspaces,
 			bridge::delete_workspace,
@@ -45,14 +48,20 @@ fn main() {
 			bridge::git_log,
 			bridge::git_show,
 			bridge::fetch_skills_sh,
+			bridge::fetch_pi_packages,
 			bridge::oauth_login,
 			bridge::oauth_login_answer,
 			bridge::oauth_login_cancel,
 			bridge::list_auth_options,
 			bridge::check_app_update,
+			updater::install_app_update,
 		])
 		.setup(|app| {
 			bridge::start_scheduler_sidecar_guard(app.handle().clone());
+			// Pre-fetch `pizza auth list --json` so Settings doesn't wait ~1s
+			// for a CLI spawn on first open.
+			let warmup_app = app.handle().clone();
+			std::thread::spawn(move || bridge::warm_auth_options(&warmup_app));
 			#[cfg(debug_assertions)]
 			{
 				if let Some(window) = app.get_webview_window("main") {

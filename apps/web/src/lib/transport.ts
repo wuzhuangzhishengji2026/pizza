@@ -14,7 +14,7 @@ import type {
 	RpcForensicEvent,
 } from "./types";
 
-import { isTauri } from "./platform";
+import { isTauri, samePath } from "./platform";
 
 /**
  * Open an external URL in the system browser. In Tauri this routes through
@@ -126,7 +126,7 @@ export async function sendCommandAwait<T = unknown>(
 				// one active when this command was issued is dropped; the correct
 				// response (or the timeout) resolves this promise instead.
 				const responseCwd = (payload as RpcResponse<T> & { _cwd?: string })._cwd;
-				if (expectedCwd && responseCwd && responseCwd !== expectedCwd) return;
+				if (expectedCwd && responseCwd && !samePath(responseCwd, expectedCwd)) return;
 				finish(() => {
 					if (payload.success) {
 						resolve(payload);
@@ -186,10 +186,34 @@ export async function subscribeSidecarExit(handler: ExitHandler): Promise<() => 
 
 // --- Init ---
 
+/**
+ * Hard ceiling for init_sidecar. The Rust side has its own watchdogs (70s for
+ * the gateway-channel get_state), but if the invoke is wedged BELOW those
+ * watchdogs (e.g. an unsettled Tauri IPC response), the boot UI would show
+ * "starting…" forever. 90s > 70s so the more precise Rust error wins when
+ * both would fire; this is the last-resort backstop that finally rejects and
+ * lets App.tsx render the init-error screen with a retry button.
+ */
+const INIT_INVOKE_TIMEOUT_MS = 90_000;
+
 export async function initSidecar(cwd?: string): Promise<Record<string, unknown> | null> {
 	if (isTauri()) {
 		const core = await import("@tauri-apps/api/core");
-		const result = await core.invoke<string>("init_sidecar", { cwd: cwd ?? null });
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const result = await Promise.race([
+			core.invoke<string>("init_sidecar", { cwd: cwd ?? null }),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() =>
+						reject(
+							new Error(
+								"init_sidecar did not respond within 90s. The bridge or gateway is wedged. Click retry, or set PIZZA_DESKTOP_GATEWAY=0 and restart to use direct sidecar mode.",
+							),
+						),
+					INIT_INVOKE_TIMEOUT_MS,
+				);
+			}),
+		]).finally(() => clearTimeout(timer));
 		let parsed = result;
 		if (typeof parsed === "string") {
 			parsed = JSON.parse(parsed);
@@ -394,6 +418,26 @@ export async function newSession(): Promise<string | null> {
 	}
 }
 
+/** A slash command invocable from the composer (extension / prompt template / skill). */
+export interface SlashCommandInfo {
+	/** Command name without the leading slash (skills use "skill:<name>"). */
+	name: string;
+	description?: string;
+	source: "extension" | "prompt" | "skill";
+	/** Hint for expected arguments (prompt templates). */
+	argumentHint?: string;
+}
+
+/** List slash commands the agent will interpret when sent via prompt (extension, prompt, skill). */
+export async function getCommands(): Promise<SlashCommandInfo[]> {
+	try {
+		const r = await sendCommandAwait<{ commands: SlashCommandInfo[] }>({ type: "get_commands" }, 10000);
+		return r.data?.commands ?? [];
+	} catch {
+		return [];
+	}
+}
+
 /** List known skills, enabled or not (enabled ones are invocable as slash commands). */
 export async function getSkills(): Promise<SkillInfo[]> {
 	try {
@@ -418,6 +462,20 @@ export async function deleteSkill(name: string): Promise<void> {
 	await sendCommandAwait({ type: "delete_skill", skillName: name }, 10000);
 }
 
+/**
+ * Install a marketplace skill in place: the agent downloads the skill's
+ * directory from its GitHub repo into the user skills dir. `source` is
+ * `owner/repo`, `slug` the skill name from the skills.sh directory.
+ */
+export async function installSkill(source: string, slug: string): Promise<{ name: string; path: string }> {
+	const r = await sendCommandAwait<{ name: string; path: string }>(
+		{ type: "install_skill", source, slug },
+		120000,
+	);
+	if (!r.data) throw new Error("Install failed");
+	return r.data;
+}
+
 export type ExtensionKind = "builtin" | "user" | "project" | "cli" | "package";
 
 export interface ExtensionInfo {
@@ -427,6 +485,8 @@ export interface ExtensionInfo {
 	kind: ExtensionKind;
 	enabled: boolean;
 	canToggle: boolean;
+	/** For package extensions: the package source — pass this (not `id`) to toggle/remove. */
+	packageSource?: string;
 	installable: boolean;
 	installed: boolean;
 	path: string;
@@ -434,6 +494,28 @@ export interface ExtensionInfo {
 	commandCount: number;
 	/** Dynamic built-in cli commands registered by this extension (e.g. `_computer_use`). */
 	builtinCommandCount: number;
+	/** For package extensions: load errors attributed to this package (e.g. pi packages needing APIs pizza lacks). */
+	loadError?: string;
+}
+
+export type ExtensionPermissionKind = "accessibility" | "screenRecording";
+
+export interface ExtensionPermissionInfo {
+	kind: ExtensionPermissionKind;
+	label: string;
+	description: string;
+	granted: boolean;
+	required: boolean;
+}
+
+export interface ExtensionPermissionState {
+	extensionId: string;
+	supported: boolean;
+	installed: boolean;
+	ready: boolean;
+	helperPath?: string;
+	message?: string;
+	permissions: ExtensionPermissionInfo[];
 }
 
 /** List all extensions (built-in + user-installed), including disabled built-ins. */
@@ -446,7 +528,40 @@ export async function getExtensions(): Promise<ExtensionInfo[]> {
 	}
 }
 
-/** Enable or disable a built-in extension. Returns whether a reload is required. */
+/** A theme known to the agent (user dir, project dir, or extension-contributed), as returned by get_themes. */
+export interface WebThemeInfo {
+	name: string;
+	label?: string;
+	path?: string;
+	source?: string;
+	builtin: boolean;
+	web?: {
+		label?: string;
+		mode: "light" | "dark";
+		/** CSS custom-property overrides keyed without the "--" prefix. */
+		tokens: Record<string, string>;
+		/** Window/document title and app brand name shown while this theme is active. */
+		title?: string;
+		/** App icon (favicon, window icon, sidebar brand mark) as a data: URI. */
+		icon?: string;
+		/** Raw CSS injected only while this theme is active (background images, animations, ...). */
+		css?: string;
+		/** Background video as a data: URI — plays muted+looping behind app content. */
+		video?: string;
+	};
+}
+
+/** List themes the agent resolved (user ~/.pizza/agent/themes, project .pizza/themes, extension themePaths). */
+export async function listThemes(): Promise<WebThemeInfo[]> {
+	try {
+		const r = await sendCommandAwait<{ themes: WebThemeInfo[] }>({ type: "get_themes" }, 10000);
+		return r.data?.themes ?? [];
+	} catch {
+		return [];
+	}
+}
+
+/** Enable or disable an extension or installed plugin package. Returns whether a reload is required. */
 export async function setExtensionEnabled(id: string, enabled: boolean): Promise<boolean> {
 	const r = await sendCommandAwait<{ requiresReload: boolean }>(
 		{ type: "set_extension_enabled", extensionId: id, enabled },
@@ -466,6 +581,21 @@ export async function installExtension(
 	return { ok: r.data?.ok ?? false, message: r.data?.message ?? "", installed: r.data?.installed ?? false };
 }
 
+/** Remove an installed package (theme/skill/prompt pack) from settings; requires a session reload to unload its resources. */
+export async function removePackage(
+	source: string,
+): Promise<{ removed: boolean; requiresReload: boolean; error?: string }> {
+	try {
+		const r = await sendCommandAwait<{ source: string; removed: boolean; requiresReload: boolean }>(
+			{ type: "remove_package", source },
+			15000,
+		);
+		return { removed: r.data?.removed ?? false, requiresReload: r.data?.requiresReload ?? true };
+	} catch (e) {
+		return { removed: false, requiresReload: false, error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
 /** Uninstall an extension's external dependency. */
 export async function uninstallExtension(
 	id: string,
@@ -475,6 +605,45 @@ export async function uninstallExtension(
 		120000,
 	);
 	return { ok: r.data?.ok ?? false, message: r.data?.message ?? "", installed: r.data?.installed ?? false };
+}
+
+export async function getExtensionPermissions(id: string): Promise<ExtensionPermissionState> {
+	const r = await sendCommandAwait<ExtensionPermissionState>(
+		{ type: "get_extension_permissions", extensionId: id },
+		30000,
+	);
+	return r.data ?? {
+		extensionId: id,
+		supported: false,
+		installed: false,
+		ready: false,
+		permissions: [],
+	};
+}
+
+export async function recheckExtensionPermissions(id: string): Promise<ExtensionPermissionState> {
+	const r = await sendCommandAwait<ExtensionPermissionState>(
+		{ type: "recheck_extension_permissions", extensionId: id },
+		30000,
+	);
+	return r.data ?? {
+		extensionId: id,
+		supported: false,
+		installed: false,
+		ready: false,
+		permissions: [],
+	};
+}
+
+export async function openExtensionPermissionSettings(
+	id: string,
+	permissionKind: ExtensionPermissionKind,
+): Promise<{ ok: boolean; message: string }> {
+	const r = await sendCommandAwait<{ ok: boolean; message: string }>(
+		{ type: "open_extension_permission_settings", extensionId: id, permissionKind },
+		8000,
+	);
+	return { ok: r.data?.ok ?? false, message: r.data?.message ?? "" };
 }
 
 // --- Skills.sh directory ---
@@ -489,12 +658,53 @@ export interface SkillsShSkill {
 	installs?: number;
 }
 
+const SKILLS_SH_CACHE_KEY = "pizza-skills-sh-cache";
+/** The skills.sh directory changes slowly — cache it for a few days. */
+const SKILLS_SH_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+
+let skillsShMemCache: { skills: SkillsShSkill[]; fetchedAt: number } | null = null;
+
+function readSkillsShCache(): { skills: SkillsShSkill[]; fetchedAt: number } | null {
+	if (skillsShMemCache) return skillsShMemCache;
+	try {
+		const raw = localStorage.getItem(SKILLS_SH_CACHE_KEY);
+		if (!raw) return null;
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed?.skills) && typeof parsed.fetchedAt === "number") {
+			skillsShMemCache = parsed;
+			return parsed;
+		}
+	} catch {
+		/* ignore */
+	}
+	return null;
+}
+
+function writeSkillsShCache(skills: SkillsShSkill[]): void {
+	const entry = { skills, fetchedAt: Date.now() };
+	skillsShMemCache = entry;
+	try {
+		localStorage.setItem(SKILLS_SH_CACHE_KEY, JSON.stringify(entry));
+	} catch {
+		/* quota — memory cache still works */
+	}
+}
+
+/** Whatever is currently cached (fresh or stale), or null — for instant first paint. */
+export function getCachedSkillsSh(): SkillsShSkill[] | null {
+	return readSkillsShCache()?.skills ?? null;
+}
+
 /**
  * Fetch skill directory from skills.sh by scraping the HTML leaderboard.
  * The official API requires Vercel OIDC auth, but the HTML page contains
  * all skill links rendered server-side.
  */
-export async function fetchSkillsSh(): Promise<SkillsShSkill[]> {
+export async function fetchSkillsSh(force = false): Promise<SkillsShSkill[]> {
+	const cached = readSkillsShCache();
+	if (!force && cached && Date.now() - cached.fetchedAt < SKILLS_SH_TTL_MS) {
+		return cached.skills;
+	}
 	try {
 		let html: string;
 		if (isTauri()) {
@@ -504,7 +714,7 @@ export async function fetchSkillsSh(): Promise<SkillsShSkill[]> {
 			const res = await fetch("https://www.skills.sh/", {
 				headers: { Accept: "text/html" },
 			});
-			if (!res.ok) return [];
+			if (!res.ok) return cached?.skills ?? [];
 			html = await res.text();
 		}
 		const seen = new Set<string>();
@@ -527,9 +737,159 @@ export async function fetchSkillsSh(): Promise<SkillsShSkill[]> {
 				installUrl: `https://github.com/${source}`,
 			});
 		}
+		// An empty scrape almost always means the page markup changed or the
+		// response was a shell — keep serving whatever we had rather than
+		// rendering an empty directory.
+		if (skills.length === 0) return cached?.skills ?? [];
+		writeSkillsShCache(skills);
 		return skills;
 	} catch {
-		return [];
+		return cached?.skills ?? [];
+	}
+}
+
+// --- Pi package directory (pi.dev/packages) ---
+
+export interface PiPackage {
+	name: string;
+	description?: string;
+	author?: string;
+	/** Monthly download count as rendered by pi.dev (e.g. "1.6M/mo"). */
+	downloadsLabel?: string;
+	downloads?: number;
+	types: string[];
+	/** pi.dev package detail page. */
+	url: string;
+	npmUrl?: string;
+	repoUrl?: string;
+}
+
+const PI_PACKAGES_CACHE_KEY = "pizza-pi-packages-cache";
+/** The pi.dev directory changes slowly — cache it for a few days. */
+const PI_PACKAGES_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+/** How many directory pages to scrape (50 packages per page). */
+const PI_PACKAGES_PAGES = 3;
+
+let piPackagesMemCache: { packages: PiPackage[]; fetchedAt: number } | null = null;
+
+function readPiPackagesCache(): { packages: PiPackage[]; fetchedAt: number } | null {
+	if (piPackagesMemCache) return piPackagesMemCache;
+	try {
+		const raw = localStorage.getItem(PI_PACKAGES_CACHE_KEY);
+		if (!raw) return null;
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed?.packages) && typeof parsed.fetchedAt === "number") {
+			piPackagesMemCache = parsed;
+			return parsed;
+		}
+	} catch {
+		/* ignore */
+	}
+	return null;
+}
+
+function writePiPackagesCache(packages: PiPackage[]): void {
+	const entry = { packages, fetchedAt: Date.now() };
+	piPackagesMemCache = entry;
+	try {
+		localStorage.setItem(PI_PACKAGES_CACHE_KEY, JSON.stringify(entry));
+	} catch {
+		/* quota — memory cache still works */
+	}
+}
+
+/** Whatever is currently cached (fresh or stale), or null — for instant first paint. */
+export function getCachedPiPackages(): PiPackage[] | null {
+	return readPiPackagesCache()?.packages ?? null;
+}
+
+function parsePiPackagesHtml(html: string, acc: Map<string, PiPackage>): void {
+	const doc = new DOMParser().parseFromString(html, "text/html");
+	for (const card of doc.querySelectorAll<HTMLElement>("article[data-package-card]")) {
+		const name = card.dataset.packageName;
+		if (!name || acc.has(name)) continue;
+		const description = card.querySelector(".packages-desc")?.textContent?.trim() || undefined;
+		const meta = card.querySelectorAll(".packages-meta span");
+		const author = meta[0]?.textContent?.trim() || undefined;
+		const downloadsLabel = meta[1]?.textContent?.trim() || undefined;
+		const downloads = Number(card.dataset.packageDownloads) || undefined;
+		const types = (card.dataset.packageTypes ?? "").split(/\s+/).filter(Boolean);
+		const link = card.querySelector<HTMLAnchorElement>("a[data-package-link]")?.getAttribute("href") ?? "";
+		const links = Array.from(card.querySelectorAll<HTMLAnchorElement>(".packages-links a"))
+			.map((a) => a.getAttribute("href") ?? "")
+			.filter(Boolean);
+		const npmUrl = links.find((l) => l.includes("npmjs.com/package/"));
+		const repoUrl = links.find((l) => l.startsWith("https://github.com/") && !l.includes("package-report"));
+		acc.set(name, {
+			name,
+			description,
+			author,
+			downloadsLabel,
+			downloads,
+			types,
+			url: `https://pi.dev${link.split("?")[0]}`,
+			npmUrl,
+			repoUrl,
+		});
+	}
+}
+
+/**
+ * Fetch the extension directory from https://pi.dev/packages.
+ * The catalog is server-rendered HTML (no public JSON API), so we scrape the
+ * package cards' data attributes. Pages are fetched sorted by downloads.
+ */
+export async function fetchPiPackages(force = false): Promise<PiPackage[]> {
+	const cached = readPiPackagesCache();
+	if (!force && cached && Date.now() - cached.fetchedAt < PI_PACKAGES_TTL_MS) {
+		return cached.packages;
+	}
+	try {
+		const query = "type=extension&sort=downloads";
+		const fetchPage = async (page: number): Promise<string> => {
+			const q = `${query}&page=${page}`;
+			if (isTauri()) {
+				const core = await import("@tauri-apps/api/core");
+				return core.invoke<string>("fetch_pi_packages", { query: q });
+			}
+			const res = await fetch(`https://pi.dev/packages?${q}`, {
+				headers: { Accept: "text/html" },
+			});
+			if (!res.ok) throw new Error(`pi.dev returned status ${res.status}`);
+			return res.text();
+		};
+		const pages = await Promise.all(
+			Array.from({ length: PI_PACKAGES_PAGES }, (_, i) => fetchPage(i + 1)),
+		);
+		const acc = new Map<string, PiPackage>();
+		for (const html of pages) parsePiPackagesHtml(html, acc);
+		const packages = Array.from(acc.values());
+		// An empty scrape almost always means the page markup changed — keep
+		// serving whatever we had rather than rendering an empty directory.
+		if (packages.length === 0) return cached?.packages ?? [];
+		writePiPackagesCache(packages);
+		return packages;
+	} catch {
+		return cached?.packages ?? [];
+	}
+}
+
+/**
+ * Install a plugin package (npm/git/local source, e.g. "npm:pi-mcp-adapter")
+ * through the agent's package manager. Requires a session reload before its
+ * resources activate.
+ */
+export async function installPluginPackage(
+	source: string,
+): Promise<{ installed: boolean; requiresReload: boolean; error?: string }> {
+	try {
+		const r = await sendCommandAwait<{ installed: boolean; requiresReload: boolean }>(
+			{ type: "install_package", source },
+			300000,
+		);
+		return { installed: r.data?.installed ?? false, requiresReload: r.data?.requiresReload ?? true };
+	} catch (e) {
+		return { installed: false, requiresReload: false, error: e instanceof Error ? e.message : String(e) };
 	}
 }
 
@@ -1015,6 +1375,26 @@ export async function setSchedulerPolicy(policy: import("./types.js").SchedulerP
 	);
 	return r.data?.policy ?? policy;
 }
+
+// --- Network (proxy for channel adapters) -----------------------------------
+
+export interface NetworkSettings {
+	/** "auto" (env/OS detection), "off" (direct), or an explicit proxy URL. */
+	proxy?: string;
+}
+
+export async function getNetwork(): Promise<NetworkSettings> {
+	const r = await sendCommandAwait<{ network: NetworkSettings }>({ type: "get_network" }, 5000);
+	return r.data?.network ?? {};
+}
+
+export async function setNetwork(network: NetworkSettings): Promise<NetworkSettings> {
+	const r = await sendCommandAwait<{ network: NetworkSettings }>(
+		{ type: "set_network", network },
+		5000,
+	);
+	return r.data?.network ?? network;
+}
 export async function getScheduledTaskHistory(
 	taskId: string,
 	scope: "main" | "workspace",
@@ -1125,4 +1505,37 @@ export async function checkAppUpdate(): Promise<AppUpdateInfo | null> {
 	} catch {
 		return null;
 	}
+}
+
+/** Progress of an in-app update, emitted as `app_update_progress`. */
+export type AppUpdateProgress =
+	| { phase: "downloading"; downloaded: number; total: number | null }
+	| { phase: "waitingForAgents"; busy: number }
+	| { phase: "installing" };
+
+/**
+ * Download, verify and install the latest release, then relaunch. Resolves
+ * only on failure (rejects with the bridge error); success restarts the app.
+ */
+export async function installAppUpdate(): Promise<void> {
+	const core = await import("@tauri-apps/api/core");
+	await core.invoke("install_app_update");
+}
+
+/** Subscribe to in-app update progress events from the Rust bridge. */
+export function onAppUpdateProgress(handler: (progress: AppUpdateProgress) => void): () => void {
+	let disposed = false;
+	let unlisten: (() => void) | undefined;
+	import("@tauri-apps/api/event").then(({ listen }) =>
+		listen<AppUpdateProgress>("app_update_progress", (e) => {
+			if (!disposed) handler(e.payload);
+		}),
+	).then((fn) => {
+		if (disposed) fn();
+		else unlisten = fn;
+	});
+	return () => {
+		disposed = true;
+		unlisten?.();
+	};
 }

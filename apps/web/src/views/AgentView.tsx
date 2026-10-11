@@ -11,8 +11,8 @@ import { textMatches } from "@/lib/highlight";
 import { Composer, type ComposerImage, type LoadedFileAttachment } from "@/components/Composer";
 import { EmptyState, Spinner } from "@/components/ui";
 import { approveToolCall, rejectToolCall } from "@/lib/transport";
-import { cn } from "@/lib/utils";
-import { hasGatewayTrailer, parseAgentMessage } from "@/lib/agent-messages";
+import { cn, samePath } from "@/lib/utils";
+import { parseAgentMessage } from "@/lib/agent-messages";
 import type { LayoutOutletContext } from "@/components/Layout";
 
 function blockToDataUrl(block: Record<string, unknown>): string | null {
@@ -199,10 +199,10 @@ function messageText(message: unknown): string {
  * the TimelineItem fields that make Conversation render it as a dedicated
  * "workspace message" card. Returns {} for ordinary user messages.
  */
-function agentMessageFields(text: string): Pick<TimelineItem, "agentMessage" | "gatewayTrailer"> {
+function agentMessageFields(text: string): Pick<TimelineItem, "agentMessage"> {
 	const parsed = parseAgentMessage(text);
 	if (!parsed) return {};
-	return { agentMessage: parsed, gatewayTrailer: hasGatewayTrailer(text) };
+	return { agentMessage: parsed };
 }
 
 /** Build a TimelineItem[] from a get_messages response, matching tool cards to results. */
@@ -540,7 +540,7 @@ export default function AgentView({
 	const handleEvent = useCallback((event: TypedEvent & { _cwd?: string }) => {
 		const eventCwd = event._cwd ?? "";
 		const currentWs = workspace ?? "";
-		const isForCurrent = eventCwd === currentWs;
+		const isForCurrent = samePath(eventCwd, currentWs);
 		const activeState = stateRef.current;
 		const eventSessionId = typeof (event as unknown as { session_id?: unknown }).session_id === "string"
 			? (event as unknown as { session_id: string }).session_id
@@ -1208,23 +1208,65 @@ export default function AgentView({
 	// Cross-workspace messages title the session with the message body, not the
 	// raw `<message from=...>` envelope markup.
 	const firstUserText = (firstUser?.agentMessage?.body ?? firstUser?.text ?? "").trim();
-	const wsName = workspace ? workspace.replace(/\/+$/, "").split("/").pop() || "" : "";
+	// No session yet → no title; the workspace dir name is not a session title.
 	const sessionTitle = firstUserText
 		? (firstUserText.length > 60 ? firstUserText.slice(0, 60).trimEnd() + "…" : firstUserText)
-		: wsName || t("agent.newSession");
+		: "";
+	// Clicking the title copies it; the tooltip swaps to a "copied" hint briefly.
+	const [titleCopied, setTitleCopied] = useState(false);
+	const titleCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	useEffect(() => () => {
+		if (titleCopyTimerRef.current) clearTimeout(titleCopyTimerRef.current);
+	}, []);
+	const copyTitle = useCallback(() => {
+		if (!sessionTitle) return;
+		void navigator.clipboard.writeText(sessionTitle);
+		setTitleCopied(true);
+		if (titleCopyTimerRef.current) clearTimeout(titleCopyTimerRef.current);
+		titleCopyTimerRef.current = setTimeout(() => setTitleCopied(false), 1500);
+	}, [sessionTitle]);
+
+	// Empty-state greeting — one of the readyPrompts strings, re-rolled each
+	// time the conversation becomes empty (mount counts via the ref seed).
+	const [greetingIdx, setGreetingIdx] = useState(() => Math.floor(Math.random() * 10));
+	const emptyRef = useRef(true);
+	useEffect(() => {
+		const empty = items.length === 0;
+		if (empty && !emptyRef.current) setGreetingIdx(Math.floor(Math.random() * 10));
+		emptyRef.current = empty;
+	}, [items.length]);
+	const readyPrompts = t("agent.readyPrompts", { returnObjects: true }) as unknown;
+	const greeting =
+		Array.isArray(readyPrompts) && typeof readyPrompts[greetingIdx] === "string"
+			? (readyPrompts[greetingIdx] as string)
+			: t("agent.readyPrompt");
 
 	return (
 		<div className="flex h-full flex-col">
 			<div
-				data-tauri-drag-region
+				data-tauri-drag-region="deep"
 				className={cn(
 					"relative flex h-11 shrink-0 items-center border-b border-border bg-surface/80 pr-[96px] backdrop-blur transition-[padding] duration-150",
 					sidebarCollapsed ? "pl-[120px]" : "pl-6",
 				)}
 			>
-				<span className="min-w-0 flex-1 truncate text-sm font-medium text-fg" title={firstUserText || sessionTitle}>
-					{sessionTitle}
-				</span>
+				{/* Title: capped at 2/5 of the bar so a long first message never
+				    crowds it; hover raises it (shadow) and shows the full text; a
+				    click copies it. Kept as a plain span — a button would mark the
+				    area non-draggable in Tauri's drag-region handling, so a span lets
+				    the title stay both clickable and draggable. */}
+				{sessionTitle ? (
+					<Tooltip label={titleCopied ? t("common.copied") : sessionTitle} align="start" className="min-w-0 max-w-[40%]">
+						<span
+							onClick={copyTitle}
+							className="block min-w-0 max-w-full cursor-pointer truncate rounded-md px-1.5 py-0.5 text-sm font-medium text-fg transition-all hover:bg-surface-2 hover:shadow-md"
+						>
+							{sessionTitle}
+						</span>
+					</Tooltip>
+				) : (
+					<span className="min-w-0 flex-1" />
+				)}
 				<button
 					type="button"
 					onClick={() => setSearchOpen((o) => { if (!o) setFocusSignal((s) => s + 1); return !o; })}
@@ -1255,14 +1297,13 @@ export default function AgentView({
 						{loadingHistory || waitingForWorkspace ? (
 							<div className="flex flex-col items-center gap-3">
 								<Spinner />
-								<p className="font-mono text-xs text-muted">{t("common.loadingHistory")}</p>
+								<p className="text-xs text-muted">{t("common.loadingHistory")}</p>
 							</div>
 						) : (
 							<EmptyState
-								title={t("common.pizza")}
-								description={
+								title={
 									sidecarReady
-										? t("agent.readyPrompt")
+										? greeting
 										: sidecarExitCode !== null
 											? t("agent.sidecarExited", { code: sidecarExitCode })
 											: t("common.starting")
@@ -1283,7 +1324,7 @@ export default function AgentView({
 			</div>
 			{error && (
 				<div className="mx-auto max-w-3xl px-6 pb-2">
-					<div className="rounded-md border border-danger/30 bg-danger/5 px-4 py-2 text-sm text-danger">
+					<div className="select-text rounded-md border border-danger/30 bg-danger/5 px-4 py-2 text-sm text-danger">
 						{error.split("\n").map((line, i) => (
 							<div key={i} className={i === 0 ? "" : "mt-0.5 text-xs opacity-70"}>
 								{line}
@@ -1300,10 +1341,10 @@ export default function AgentView({
 								key={q.id}
 								className="group flex items-center gap-2 rounded-md border border-border/60 bg-surface-2/60 px-3 py-1.5"
 							>
-								<span className="shrink-0 rounded-sm bg-accent/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-accent">
+								<span className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted">
 									{t("conversation.queued")}
 								</span>
-								<span className="min-w-0 flex-1 truncate text-sm text-muted" title={q.text}>
+								<span className="min-w-0 flex-1 select-text truncate text-sm text-muted" title={q.text}>
 									{q.text}
 								</span>
 								<Tooltip label={t("conversation.steerQueued")}>

@@ -11,7 +11,7 @@ import {
 } from "@/lib/transport";
 import type { RpcHistoryTreeNode } from "@/lib/types";
 import { Button, EmptyState, ErrorBanner, Field, Modal, Spinner } from "@/components/ui";
-import { cn } from "@/lib/utils";
+import { cn, samePath } from "@/lib/utils";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui";
 
 interface ContextMenuState {
@@ -158,7 +158,7 @@ export default function BranchTreeExplorer({ workspace }: { workspace?: string |
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const unlistenP = subscribeEvents((event) => {
 			const typed = event as { type?: string; _cwd?: string };
-			if (typed._cwd && workspace && typed._cwd !== workspace) return;
+			if (typed._cwd && workspace && !samePath(typed._cwd, workspace)) return;
 			if (
 				typed.type === "SESSION_CREATED" ||
 				typed.type === "SESSION_FORKED" ||
@@ -471,12 +471,12 @@ function TreeRow({
 							{label}
 						</span>
 						{node.is_active && (
-							<span className="shrink-0 rounded bg-accent/15 px-1 text-[9px] uppercase tracking-wide text-accent">
+							<span className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-accent">
 								active
 							</span>
 						)}
 						{!node.is_active && !node.closed && (
-							<span className="shrink-0 rounded bg-success/15 px-1 text-[9px] uppercase tracking-wide text-success">
+							<span className="shrink-0 rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-success">
 								open
 							</span>
 						)}
